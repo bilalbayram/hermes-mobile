@@ -5,7 +5,8 @@ device management, uploads, and operator commands used by Talaria.
 
 ## What is here
 
-- `plugins/hermes_mobile`: plugin package and `plugin.yaml`
+- `plugin.yaml`: Hermes plugin manifest at the repo root
+- `plugins/hermes_mobile`: plugin package implementation
 - `tests/plugin`: plugin-owned test suite
 
 ## Operator surface
