@@ -2,7 +2,7 @@ import sqlite3
 import unittest
 import inspect
 
-from plugins.hermes_mobile import register
+from hermes_mobile import register
 from helpers import EnvHarness, FakeContext, FakeProfileRuntime, FakeRequest, response_json
 
 

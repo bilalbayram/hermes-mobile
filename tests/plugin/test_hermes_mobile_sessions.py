@@ -4,7 +4,7 @@ import asyncio
 import sqlite3
 import json
 
-from plugins.hermes_mobile import register
+from hermes_mobile import register
 from helpers import (
     EnvHarness,
     FakeContext,

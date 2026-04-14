@@ -4,7 +4,7 @@ import os
 import sqlite3
 import unittest
 
-from plugins.hermes_mobile import register
+from hermes_mobile import register
 from helpers import EnvHarness, FakeContext, FakeRequest, response_json
 
 

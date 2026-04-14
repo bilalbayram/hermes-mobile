@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from plugins.hermes_mobile.http import parse_json_response
+from hermes_mobile.http import parse_json_response
 
 
 def _normalize_text(value: str) -> str:

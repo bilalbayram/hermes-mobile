@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from plugins.hermes_mobile import register
-from plugins.hermes_mobile.push import APNsPushSender
+from hermes_mobile import register
+from hermes_mobile.push import APNsPushSender
 from helpers import (
     EnvHarness,
     FakeContext,
@@ -496,8 +496,8 @@ class HermesMobilePushDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with mock.patch.dict(sys.modules, {"jwt": fake_jwt}):
-            with mock.patch("plugins.hermes_mobile.push.shutil.which", return_value="/usr/bin/curl"):
-                with mock.patch("plugins.hermes_mobile.push.subprocess.run", return_value=completed) as run:
+            with mock.patch("hermes_mobile.push.shutil.which", return_value="/usr/bin/curl"):
+                with mock.patch("hermes_mobile.push.subprocess.run", return_value=completed) as run:
                     result = sender.send(
                         device_token="push-token-1",
                         environment="sandbox",

@@ -7,9 +7,9 @@ import io
 import json
 import unittest
 
-from plugins.hermes_mobile import register
-from plugins.hermes_mobile.config import MobilePluginConfig
-from plugins.hermes_mobile.operator_surface import MobileOperatorSurface
+from hermes_mobile import register
+from hermes_mobile.config import MobilePluginConfig
+from hermes_mobile.operator_surface import MobileOperatorSurface
 from helpers import EnvHarness, FakeContext, FakeProfileRuntime
 
 

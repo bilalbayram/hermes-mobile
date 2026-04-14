@@ -1,4 +1,4 @@
 name: hermes_mobile
 version: 0.1.0
-entrypoint: plugins.hermes_mobile:register
+entrypoint: hermes_mobile:register
 description: Hermes mobile plugin scaffold with auth foundation routes.

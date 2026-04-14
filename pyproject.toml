@@ -18,7 +18,4 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["plugins*"]
-
-[tool.setuptools.package-data]
-"plugins.hermes_mobile" = ["plugin.yaml"]
+include = ["hermes_mobile*"]
