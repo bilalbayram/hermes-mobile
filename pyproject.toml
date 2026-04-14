@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mobile"
+version = "0.1.0"
+description = "Hermes mobile plugin for Talaria-compatible clients."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "PyJWT>=2.8",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["plugins*"]
+
+[tool.setuptools.package-data]
+"plugins.hermes_mobile" = ["plugin.yaml"]
