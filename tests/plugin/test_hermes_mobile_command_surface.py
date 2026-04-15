@@ -58,6 +58,7 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
     def test_registers_mobile_tools_and_cli_command(self):
         self.assertIn("mobile_generate_pairing_code", self.ctx.tools)
         self.assertIn("mobile_install_or_verify", self.ctx.tools)
+        self.assertIn("mobile_prepare_connection_bundle", self.ctx.tools)
         self.assertIn("mobile", self.ctx.cli_commands)
 
     def test_install_or_verify_reports_stable_channel_and_plugin_identity(self):
@@ -141,6 +142,113 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    def test_prepare_talaria_connection_bundle_formats_block_and_json(self):
+        surface = MobileOperatorSurface(
+            config=MobilePluginConfig(),
+            store=FakePairingCodeStore(),  # type: ignore[arg-type]
+            profile_runtime=FakeProfileRuntime(str(self.env.hermes_home)),
+        )
+        surface.install_or_verify = lambda channel=None: {
+            "ok": True,
+            "status": "verified",
+            "install_channel": channel or "stable",
+            "repository": "github.com/bilalbayram/hermes-mobile",
+            "version": "0.1.0",
+        }
+        surface.generate_pairing_code = lambda profile_name=None: {
+            "ok": True,
+            "profile_name": profile_name or "default",
+            "pairing_code": "ABCD-WXYZ",
+            "install_channel": "stable",
+            "created_at": 1_699_999_400,
+            "expires_at": 1_700_000_000,
+        }
+
+        payload = surface.prepare_talaria_connection_bundle(
+            server_name="Home Hermes",
+            base_url="https://hermes.example.ts.net/",
+            profile_name="work",
+            connection_mode="tailscale",
+        )
+
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["install"]["status"], "verified")
+        self.assertEqual(payload["bundle"]["server_name"], "Home Hermes")
+        self.assertEqual(payload["bundle"]["base_url"], "https://hermes.example.ts.net")
+        self.assertEqual(payload["bundle"]["profile_name"], "work")
+        self.assertEqual(payload["bundle"]["pairing_code"], "ABCD-WXYZ")
+        self.assertEqual(payload["bundle"]["connection_mode"], "tailscale")
+        self.assertEqual(payload["bundle"]["expires_at"], 1_700_000_000)
+        self.assertIn("TALARIA-CONNECT", payload["bundle_text"])
+        self.assertIn("Server: Home Hermes", payload["bundle_text"])
+        self.assertIn("URL: https://hermes.example.ts.net", payload["bundle_text"])
+        self.assertIn("Profile: work", payload["bundle_text"])
+        self.assertIn("Code: ABCD-WXYZ", payload["bundle_text"])
+        self.assertEqual(payload["bundle_json"], payload["bundle"])
+
+    def test_prepare_talaria_connection_bundle_rejects_non_https_urls(self):
+        surface = MobileOperatorSurface(
+            config=MobilePluginConfig(),
+            store=FakePairingCodeStore(),  # type: ignore[arg-type]
+            profile_runtime=FakeProfileRuntime(str(self.env.hermes_home)),
+        )
+
+        payload = surface.prepare_talaria_connection_bundle(
+            base_url="http://127.0.0.1:8642",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "ok": False,
+                "error": "invalid_base_url",
+                "message": "base_url must be an https URL",
+            },
+        )
+
+    def test_prepare_connection_bundle_returns_text_and_json_bundle(self):
+        handler = self.ctx.tools["mobile_prepare_connection_bundle"]["handler"]
+
+        payload = handler(
+            {
+                "base_url": "https://hermes.example.com:8642",
+                "server_name": "Home Hermes",
+                "profile_name": "default",
+                "connection_mode": "tailscale",
+            }
+        )
+
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["bundle_format"], "talaria-connect-v1")
+        self.assertEqual(payload["server_name"], "Home Hermes")
+        self.assertEqual(payload["base_url"], "https://hermes.example.com:8642")
+        self.assertEqual(payload["profile_name"], "default")
+        self.assertRegex(payload["pairing_code"], r"^[A-Z2-9]{4}-[A-Z2-9]{4}$")
+        self.assertEqual(payload["connection_mode"], "tailscale")
+        self.assertIn("TALARIA-CONNECT", payload["bundle_text"])
+        self.assertEqual(payload["bundle_json"]["server_name"], "Home Hermes")
+        self.assertEqual(payload["bundle_json"]["base_url"], "https://hermes.example.com:8642")
+        self.assertEqual(payload["bundle_json"]["profile_name"], "default")
+        self.assertEqual(payload["bundle_json"]["pairing_code"], payload["pairing_code"])
+
+    def test_prepare_connection_bundle_rejects_non_https_url(self):
+        handler = self.ctx.tools["mobile_prepare_connection_bundle"]["handler"]
+
+        payload = handler(
+            {
+                "base_url": "http://192.168.1.20:8642",
+            }
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "ok": False,
+                "error": "invalid_base_url",
+                "message": "base_url must be an https URL",
+            },
+        )
+
     def test_cli_command_emits_json_for_pairing_code(self):
         entry = self.ctx.cli_commands["mobile"]
         parser = argparse.ArgumentParser()
@@ -173,6 +281,64 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["status"], "verified")
         self.assertEqual(payload["install_channel"], "stable")
         self.assertEqual(payload["repository"], "github.com/bilalbayram/hermes-mobile")
+
+    def test_cli_command_emits_json_for_connection_bundle(self):
+        entry = self.ctx.cli_commands["mobile"]
+        parser = argparse.ArgumentParser()
+        entry["setup_fn"](parser)
+        args = parser.parse_args(
+            [
+                "prepare-connection-bundle",
+                "--base-url",
+                "https://hermes.example.com",
+                "--server-name",
+                "Home Hermes",
+                "--target-profile",
+                "default",
+                "--connection-mode",
+                "tailscale",
+            ]
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = entry["handler_fn"](args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["server_name"], "Home Hermes")
+        self.assertEqual(payload["base_url"], "https://hermes.example.com")
+        self.assertEqual(payload["profile_name"], "default")
+        self.assertEqual(payload["connection_mode"], "tailscale")
+        self.assertIn("TALARIA-CONNECT", payload["bundle_text"])
+
+    def test_cli_command_emits_json_for_talaria_connection_bundle(self):
+        entry = self.ctx.cli_commands["mobile"]
+        parser = argparse.ArgumentParser()
+        entry["setup_fn"](parser)
+        args = parser.parse_args(
+            [
+                "prepare-talaria-connection-bundle",
+                "--server-name",
+                "Home Hermes",
+                "--base-url",
+                "https://hermes.example.ts.net",
+                "--target-profile",
+                "default",
+            ]
+        )
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = entry["handler_fn"](args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["bundle"]["server_name"], "Home Hermes")
+        self.assertEqual(payload["bundle"]["base_url"], "https://hermes.example.ts.net")
+        self.assertEqual(payload["bundle"]["profile_name"], "default")
 
 
 if __name__ == "__main__":
