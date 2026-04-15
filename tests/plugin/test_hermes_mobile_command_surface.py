@@ -60,6 +60,7 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mobile_install_or_verify", self.ctx.tools)
         self.assertIn("mobile_prepare_connection_bundle", self.ctx.tools)
         self.assertIn("mobile", self.ctx.cli_commands)
+        self.assertIn("talaria-mobile", self.ctx.cli_commands)
 
     def test_install_or_verify_reports_stable_channel_and_plugin_identity(self):
         handler = self.ctx.tools["mobile_install_or_verify"]["handler"]
@@ -237,6 +238,24 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
         payload = handler(
             {
                 "base_url": "http://192.168.1.20:8642",
+            }
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "ok": False,
+                "error": "invalid_base_url",
+                "message": "base_url must be an https URL",
+            },
+        )
+
+    def test_prepare_connection_bundle_rejects_urls_with_credentials(self):
+        handler = self.ctx.tools["mobile_prepare_connection_bundle"]["handler"]
+
+        payload = handler(
+            {
+                "base_url": "https://user:pass@hermes.example.com",
             }
         )
 

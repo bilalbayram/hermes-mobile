@@ -19,6 +19,7 @@ The plugin exposes:
 - `hermes mobile install-or-verify --channel stable`
 - `hermes mobile generate-pairing-code --target-profile <name>`
 - `hermes mobile prepare-connection-bundle --base-url <https-url> --target-profile <name>`
+- `hermes talaria-mobile prepare-connection-bundle --base-url <https-url> --target-profile <name>`
 
 ## Talaria connection bundles
 

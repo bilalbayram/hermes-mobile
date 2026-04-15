@@ -39,7 +39,15 @@ def _normalize_https_url(value: str) -> str | None:
     parsed = urlparse(raw)
     if parsed.scheme.lower() != "https" or not parsed.netloc:
         return None
-    normalized = f"https://{parsed.netloc}{parsed.path or ''}"
+    if parsed.username or parsed.password:
+        return None
+    host = parsed.hostname or ""
+    if not host:
+        return None
+    netloc = host
+    if parsed.port:
+        netloc = f"{host}:{parsed.port}"
+    normalized = f"https://{netloc}{parsed.path or ''}"
     return normalized.rstrip("/")
 
 
@@ -356,10 +364,11 @@ def register_operator_surface(context: Any, surface: MobileOperatorSurface) -> N
 
     register_cli_command = getattr(context, "register_cli_command", None)
     if callable(register_cli_command):
-        register_cli_command(
-            name="mobile",
-            help="Manage hermes-mobile install state and pairing codes",
-            setup_fn=_register_cli,
-            handler_fn=lambda args: _cli_handler(surface, args),
-            description="Operator-facing hermes-mobile commands.",
-        )
+        for command_name in ("mobile", "talaria-mobile"):
+            register_cli_command(
+                name=command_name,
+                help="Manage hermes-mobile install state and pairing codes",
+                setup_fn=_register_cli,
+                handler_fn=lambda args: _cli_handler(surface, args),
+                description="Operator-facing hermes-mobile commands.",
+            )
