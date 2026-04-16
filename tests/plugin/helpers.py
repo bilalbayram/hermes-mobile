@@ -528,6 +528,53 @@ class FakeProfileRuntime:
             delay = 0.5
         elif "Slow sync response" in user_message:
             delay = 0.2
+        waiting_prompt = None
+        runtime_events: list[dict[str, Any]] = []
+        if "Needs answer" in user_message:
+            waiting_prompt = "What should Hermes do next?"
+            runtime_events = [
+                {
+                    "_delay": delay,
+                    "event": "tool",
+                    "type": "tool.started",
+                    "tool_name": "web_search",
+                    "preview": "Searching deployment options",
+                },
+                {
+                    "event": "tool",
+                    "type": "tool.completed",
+                    "tool_name": "web_search",
+                    "preview": "Found multiple deployment options",
+                },
+                {
+                    "event": "waiting",
+                    "reason": "human_input",
+                    "prompt": waiting_prompt,
+                },
+            ]
+        elif "Resume answer" in user_message:
+            runtime_events = [
+                {
+                    "_delay": delay,
+                    "event": "tool",
+                    "type": "tool.started",
+                    "tool_name": "planner",
+                    "preview": "Collecting requirements",
+                },
+                {
+                    "event": "waiting",
+                    "reason": "human_input",
+                    "prompt": "Which environment should I target?",
+                },
+                {"event": "resumed"},
+                {"event": "delta", "delta": first},
+                {"event": "delta", "delta": second},
+                {
+                    "event": "completed",
+                    "content": final_text,
+                    "usage": {"input_tokens": 10, "output_tokens": 11, "total_tokens": 21},
+                },
+            ]
         now = time.time()
         conn = sqlite3.connect(str(home / "state.db"))
         conn.row_factory = sqlite3.Row
@@ -546,13 +593,14 @@ class FakeProfileRuntime:
             """,
             (session_id, user_message, now),
         )
-        conn.execute(
-            """
-            INSERT INTO messages(session_id, role, content, timestamp)
-            VALUES (?, 'assistant', ?, ?)
-            """,
-            (session_id, final_text, now + 0.001),
-        )
+        if waiting_prompt is None:
+            conn.execute(
+                """
+                INSERT INTO messages(session_id, role, content, timestamp)
+                VALUES (?, 'assistant', ?, ?)
+                """,
+                (session_id, final_text, now + 0.001),
+            )
         conn.execute(
             """
             UPDATE sessions
@@ -565,6 +613,9 @@ class FakeProfileRuntime:
         )
         conn.commit()
         conn.close()
+
+        if runtime_events:
+            return FakeWorkerHandle(runtime_events)
 
         return FakeWorkerHandle(
             [

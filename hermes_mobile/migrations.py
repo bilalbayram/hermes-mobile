@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-MOBILE_SCHEMA_VERSION = 5
+MOBILE_SCHEMA_VERSION = 6
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -21,6 +21,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         (3, _migrate_v3),
         (4, _migrate_v4),
         (5, _migrate_v5),
+        (6, _migrate_v6),
     ):
         if version >= target_version:
             continue
@@ -272,3 +273,74 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "mobile_devices", "platform", "platform TEXT")
     _ensure_column(conn, "mobile_devices", "app_version", "app_version TEXT")
+
+
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "mobile_message_requests", "profile_name", "profile_name TEXT")
+    conn.execute(
+        """
+        UPDATE mobile_message_requests
+        SET profile_name = (
+            SELECT d.profile_name
+            FROM mobile_devices d
+            WHERE d.id = mobile_message_requests.device_id
+        )
+        WHERE profile_name IS NULL OR TRIM(profile_name) = ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mobile_message_requests_profile_session_updated
+        ON mobile_message_requests(profile_name, session_id, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mobile_notification_policies (
+            profile_name TEXT NOT NULL,
+            device_scope TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            delivery_mode TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(profile_name, device_scope, event_type)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mobile_notification_policies_profile_updated
+        ON mobile_notification_policies(profile_name, updated_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mobile_inbox_items (
+            id TEXT PRIMARY KEY,
+            profile_name TEXT NOT NULL,
+            device_scope TEXT NOT NULL,
+            session_id TEXT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            body_preview TEXT NOT NULL,
+            deep_link_target TEXT,
+            created_at INTEGER NOT NULL,
+            read_at INTEGER,
+            archived_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mobile_inbox_items_profile_created
+        ON mobile_inbox_items(profile_name, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mobile_inbox_items_device_created
+        ON mobile_inbox_items(profile_name, device_scope, created_at DESC)
+        """
+    )

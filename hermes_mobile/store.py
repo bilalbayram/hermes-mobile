@@ -38,6 +38,49 @@ def _safe_json_load(raw: str) -> dict:
         return {}
 
 
+def _preview_body(body: str, limit: int = 160) -> str:
+    compact = " ".join(str(body or "").replace("\r", " ").replace("\n", " ").split()).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _runtime_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"pending", "running"}:
+        return "running"
+    if normalized == "streaming":
+        return "streaming"
+    if normalized == "waiting":
+        return "waiting_on_human"
+    if normalized in {"completed", "failed", "aborted"}:
+        return normalized
+    return "idle"
+
+
+def _runtime_events_from_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    events = response.get("stream", {}).get("events")
+    if not isinstance(events, list):
+        return []
+    runtime_events: list[dict[str, Any]] = []
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        event_type = str(item.get("type") or "").strip()
+        if not event_type or event_type in {"message.accepted", "message.delta"}:
+            continue
+        runtime_events.append(dict(item))
+    return runtime_events
+
+
+def _waiting_prompt_from_events(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        if str(event.get("type") or "").strip() == "run.waiting":
+            prompt = str(event.get("prompt") or "").strip()
+            return prompt or None
+    return None
+
+
 @dataclass(frozen=True)
 class SessionTokens:
     access_token: str
@@ -348,6 +391,7 @@ class MobileAuthStore:
         self,
         *,
         request_id: str,
+        profile_name: str,
         session_id: str,
         device_id: str,
         client_message_id: str,
@@ -362,11 +406,12 @@ class MobileAuthStore:
             self.conn.execute(
                 """
                 INSERT INTO mobile_message_requests(
-                    id, session_id, device_id, client_message_id, request_payload_hash, status, response_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, profile_name, session_id, device_id, client_message_id, request_payload_hash, status, response_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
+                    profile_name,
                     session_id,
                     device_id,
                     client_message_id,
@@ -438,6 +483,331 @@ class MobileAuthStore:
             self.conn.commit()
         except sqlite3.ProgrammingError:
             return
+
+    def session_runtime_summary(
+        self,
+        *,
+        profile_name: str,
+        session_id: str,
+    ) -> dict | None:
+        if self._closed:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT id, status, response_json, updated_at
+            FROM mobile_message_requests
+            WHERE profile_name = ? AND session_id = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (profile_name, session_id),
+        ).fetchone()
+        return self._runtime_summary_from_row(row)
+
+    def session_runtime_summaries(
+        self,
+        *,
+        profile_name: str,
+        session_ids: list[str],
+    ) -> dict[str, dict]:
+        if self._closed or not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT id, session_id, status, response_json, updated_at
+            FROM mobile_message_requests
+            WHERE profile_name = ? AND session_id IN ({placeholders})
+            ORDER BY updated_at DESC, created_at DESC
+            """,
+            (profile_name, *session_ids),
+        ).fetchall()
+        summaries: dict[str, dict] = {}
+        for row in rows:
+            session_id = str(row["session_id"] or "").strip()
+            if not session_id or session_id in summaries:
+                continue
+            summary = self._runtime_summary_from_row(row)
+            if summary is not None:
+                summaries[session_id] = summary
+        return summaries
+
+    def _runtime_summary_from_row(self, row: Any) -> dict | None:
+        if not row:
+            return None
+        response = _safe_json_load(row["response_json"] or "{}")
+        events = _runtime_events_from_response(response)
+        runtime_status = _runtime_status(row["status"])
+        last_activity_at = int(row["updated_at"] or int(self._clock()))
+        last_event = events[-1] if events else None
+        if last_event is not None and last_event.get("created_at") is not None:
+            try:
+                last_activity_at = max(last_activity_at, int(float(last_event["created_at"])))
+            except Exception:
+                pass
+        summary = {
+            "runtime_status": runtime_status,
+            "waiting_prompt": _waiting_prompt_from_events(events),
+            "last_runtime_activity_at": last_activity_at,
+            "runtime_events": events,
+        }
+        if runtime_status in {"running", "streaming", "waiting_on_human"}:
+            summary["active_run_request_id"] = row["id"]
+        else:
+            summary["active_run_request_id"] = None
+        return summary
+
+    def list_notification_policies(
+        self,
+        *,
+        profile_name: str,
+        device_id: str | None = None,
+    ) -> list[dict]:
+        if self._closed:
+            return []
+        device_scope = str(device_id or "").strip()
+        rows = self.conn.execute(
+            """
+            SELECT profile_name, device_scope, event_type, delivery_mode, enabled, created_at, updated_at
+            FROM mobile_notification_policies
+            WHERE profile_name = ? AND (device_scope = '' OR device_scope = ?)
+            ORDER BY device_scope DESC, event_type ASC
+            """,
+            (profile_name, device_scope),
+        ).fetchall()
+        return [
+            {
+                "profile_name": row["profile_name"],
+                "device_id": row["device_scope"] or None,
+                "event_type": row["event_type"],
+                "delivery_mode": row["delivery_mode"],
+                "enabled": bool(row["enabled"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def set_notification_policy(
+        self,
+        *,
+        profile_name: str,
+        event_type: str,
+        delivery_mode: str,
+        enabled: bool,
+        device_id: str | None = None,
+    ) -> dict:
+        if self._closed:
+            return {}
+        now = int(self._clock())
+        device_scope = str(device_id or "").strip()
+        self.conn.execute(
+            """
+            INSERT INTO mobile_notification_policies(
+                profile_name, device_scope, event_type, delivery_mode, enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_name, device_scope, event_type) DO UPDATE SET
+                delivery_mode = excluded.delivery_mode,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            """,
+            (
+                profile_name,
+                device_scope,
+                event_type,
+                delivery_mode,
+                1 if enabled else 0,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return {
+            "profile_name": profile_name,
+            "device_id": device_scope or None,
+            "event_type": event_type,
+            "delivery_mode": delivery_mode,
+            "enabled": enabled,
+            "updated_at": now,
+        }
+
+    def resolve_notification_policy(
+        self,
+        *,
+        profile_name: str,
+        event_type: str,
+        device_id: str | None = None,
+        default_mode: str,
+    ) -> dict:
+        if self._closed:
+            return {
+                "event_type": event_type,
+                "delivery_mode": default_mode,
+                "enabled": True,
+                "source": "default",
+            }
+        device_scope = str(device_id or "").strip()
+        rows = self.conn.execute(
+            """
+            SELECT device_scope, delivery_mode, enabled
+            FROM mobile_notification_policies
+            WHERE profile_name = ? AND event_type = ? AND device_scope IN ('', ?)
+            ORDER BY device_scope DESC
+            LIMIT 1
+            """,
+            (profile_name, event_type, device_scope),
+        ).fetchall()
+        if rows:
+            row = rows[0]
+            return {
+                "event_type": event_type,
+                "delivery_mode": row["delivery_mode"],
+                "enabled": bool(row["enabled"]),
+                "source": "device" if row["device_scope"] else "profile",
+            }
+        return {
+            "event_type": event_type,
+            "delivery_mode": default_mode,
+            "enabled": True,
+            "source": "default",
+        }
+
+    def create_inbox_item(
+        self,
+        *,
+        profile_name: str,
+        kind: str,
+        title: str,
+        body: str,
+        session_id: str | None = None,
+        deep_link_target: str | None = None,
+        device_id: str | None = None,
+    ) -> dict:
+        if self._closed:
+            return {}
+        now = int(self._clock())
+        item_id = str(uuid.uuid4())
+        device_scope = str(device_id or "").strip()
+        self.conn.execute(
+            """
+            INSERT INTO mobile_inbox_items(
+                id, profile_name, device_scope, session_id, kind, title, body, body_preview, deep_link_target,
+                created_at, read_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                item_id,
+                profile_name,
+                device_scope,
+                session_id,
+                kind,
+                title,
+                body,
+                _preview_body(body),
+                deep_link_target,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return {
+            "id": item_id,
+            "profile_name": profile_name,
+            "device_id": device_scope or None,
+            "session_id": session_id,
+            "kind": kind,
+            "title": title,
+            "body": body,
+            "body_preview": _preview_body(body),
+            "deep_link_target": deep_link_target,
+            "created_at": now,
+            "read_at": None,
+            "archived_at": None,
+        }
+
+    def list_inbox_items(
+        self,
+        *,
+        profile_name: str,
+        device_id: str | None = None,
+        unread_only: bool = False,
+        limit: int = 50,
+    ) -> list[dict]:
+        if self._closed:
+            return []
+        device_scope = str(device_id or "").strip()
+        filters = [
+            "profile_name = ?",
+            "(device_scope = '' OR device_scope = ?)",
+            "archived_at IS NULL",
+        ]
+        args: list[Any] = [profile_name, device_scope]
+        if unread_only:
+            filters.append("read_at IS NULL")
+        args.append(max(1, int(limit)))
+        rows = self.conn.execute(
+            f"""
+            SELECT id, profile_name, device_scope, session_id, kind, title, body, body_preview,
+                   deep_link_target, created_at, read_at, archived_at
+            FROM mobile_inbox_items
+            WHERE {' AND '.join(filters)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            args,
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "profile_name": row["profile_name"],
+                "device_id": row["device_scope"] or None,
+                "session_id": row["session_id"],
+                "kind": row["kind"],
+                "title": row["title"],
+                "body": row["body"],
+                "body_preview": row["body_preview"],
+                "deep_link_target": row["deep_link_target"],
+                "created_at": row["created_at"],
+                "read_at": row["read_at"],
+                "archived_at": row["archived_at"],
+            }
+            for row in rows
+        ]
+
+    def mark_inbox_item_read(
+        self,
+        *,
+        profile_name: str,
+        item_id: str,
+        device_id: str | None = None,
+    ) -> dict | None:
+        if self._closed:
+            return None
+        device_scope = str(device_id or "").strip()
+        row = self.conn.execute(
+            """
+            SELECT id, read_at
+            FROM mobile_inbox_items
+            WHERE id = ? AND profile_name = ? AND (device_scope = '' OR device_scope = ?)
+            LIMIT 1
+            """,
+            (item_id, profile_name, device_scope),
+        ).fetchone()
+        if not row:
+            return None
+        now = int(self._clock())
+        self.conn.execute(
+            """
+            UPDATE mobile_inbox_items
+            SET read_at = COALESCE(read_at, ?)
+            WHERE id = ?
+            """,
+            (now, item_id),
+        )
+        self.conn.commit()
+        return {
+            "id": item_id,
+            "read_at": row["read_at"] if row["read_at"] is not None else now,
+        }
 
     def upsert_push_registration(
         self,

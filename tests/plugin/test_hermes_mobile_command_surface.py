@@ -59,6 +59,11 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mobile_generate_pairing_code", self.ctx.tools)
         self.assertIn("mobile_install_or_verify", self.ctx.tools)
         self.assertIn("mobile_prepare_connection_bundle", self.ctx.tools)
+        self.assertIn("mobile_get_notification_policy", self.ctx.tools)
+        self.assertIn("mobile_set_notification_policy", self.ctx.tools)
+        self.assertIn("mobile_send_inbox_item", self.ctx.tools)
+        self.assertIn("mobile_list_inbox_items", self.ctx.tools)
+        self.assertIn("mobile_notify", self.ctx.tools)
         self.assertIn("mobile", self.ctx.cli_commands)
         self.assertIn("talaria-mobile", self.ctx.cli_commands)
 
@@ -267,6 +272,48 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
                 "message": "base_url must be an https URL",
             },
         )
+
+    def test_notification_policy_round_trip_uses_store(self):
+        set_handler = self.ctx.tools["mobile_set_notification_policy"]["handler"]
+        get_handler = self.ctx.tools["mobile_get_notification_policy"]["handler"]
+
+        set_payload = set_handler(
+            {
+                "event_type": "run.waiting",
+                "delivery_mode": "alert_and_inbox",
+                "enabled": True,
+            }
+        )
+        get_payload = get_handler({})
+
+        self.assertEqual(set_payload["ok"], True)
+        self.assertEqual(set_payload["policy"]["event_type"], "run.waiting")
+        self.assertEqual(set_payload["policy"]["delivery_mode"], "alert_and_inbox")
+        self.assertEqual(get_payload["ok"], True)
+        self.assertEqual(len(get_payload["policies"]), 1)
+        self.assertEqual(get_payload["policies"][0]["event_type"], "run.waiting")
+
+    def test_send_inbox_item_creates_durable_item(self):
+        send_handler = self.ctx.tools["mobile_send_inbox_item"]["handler"]
+        list_handler = self.ctx.tools["mobile_list_inbox_items"]["handler"]
+
+        send_payload = send_handler(
+            {
+                "title": "Need your answer",
+                "body": "Which deployment target should I use?",
+                "kind": "run.waiting",
+                "session_id": "session-1",
+                "deep_link_target": "session:session-1",
+            }
+        )
+        list_payload = list_handler({})
+
+        self.assertEqual(send_payload["ok"], True)
+        self.assertEqual(send_payload["item"]["kind"], "run.waiting")
+        self.assertEqual(send_payload["item"]["session_id"], "session-1")
+        self.assertEqual(list_payload["ok"], True)
+        self.assertEqual(len(list_payload["items"]), 1)
+        self.assertEqual(list_payload["items"][0]["title"], "Need your answer")
 
     def test_cli_command_emits_json_for_pairing_code(self):
         entry = self.ctx.cli_commands["mobile"]

@@ -29,6 +29,16 @@ _ALLOWED_UPLOAD_CONTENT_TYPES = {
     "text/plain",
 }
 
+_DEFAULT_NOTIFICATION_MODES = {
+    "message.completed": "silent_refresh",
+    "run.waiting": "alert_and_inbox",
+    "run.failed": "alert_and_inbox",
+    "message.failed": "alert_and_inbox",
+    "message.aborted": "silent_refresh",
+    "agent.message": "alert_and_inbox",
+    "inbox.item.created": "alert_and_inbox",
+}
+
 
 def _bearer_token(request: Any) -> str | None:
     headers = getattr(request, "headers", {}) or {}
@@ -61,6 +71,21 @@ def _extract_device_id(request: Any, suffix: str) -> str | None:
 
     path = str(getattr(request, "path", ""))
     prefix = "/mobile/devices/"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    raw = path[len(prefix) : len(path) - len(suffix)]
+    if not raw or "/" in raw:
+        return None
+    return raw
+
+
+def _extract_inbox_item_id(request: Any, suffix: str) -> str | None:
+    match_info = getattr(request, "match_info", {}) or {}
+    if "item_id" in match_info and match_info["item_id"]:
+        return str(match_info["item_id"])
+
+    path = str(getattr(request, "path", ""))
+    prefix = "/mobile/inbox/"
     if not path.startswith(prefix) or not path.endswith(suffix):
         return None
     raw = path[len(prefix) : len(path) - len(suffix)]
@@ -161,6 +186,8 @@ class MobileRoutes:
         route_registrar("GET", "/mobile/push/diagnostics", self.push_diagnostics)
         route_registrar("GET", "/mobile/devices", self.devices_list)
         route_registrar("POST", "/mobile/devices/{device_id}/revoke", self.device_revoke)
+        route_registrar("GET", "/mobile/inbox", self.inbox_list)
+        route_registrar("POST", "/mobile/inbox/{item_id}/read", self.inbox_mark_read)
         route_registrar("POST", "/mobile/uploads", self.uploads_create)
 
     async def capabilities(self, _request: Any):
@@ -183,6 +210,8 @@ class MobileRoutes:
                     "push_diagnostics": True,
                     "devices_list": True,
                     "device_revoke": True,
+                    "inbox_list": True,
+                    "inbox_mark_read": True,
                     "uploads": True,
                 },
                 "pairing": {
@@ -308,6 +337,49 @@ class MobileRoutes:
                 "revoked": True,
                 "device_id": revoked["device_id"],
                 "revoked_at": revoked["revoked_at"],
+            },
+        )
+
+    async def inbox_list(self, request: Any):
+        auth = self._authorize(request)
+        if not auth:
+            return error_response(401, "unauthorized", "invalid access token")
+        body = await _json_body(request)
+        unread_only = bool(body.get("unread_only", False))
+        items = self.store.list_inbox_items(
+            profile_name=auth["profile_name"],
+            device_id=auth["device_id"],
+            unread_only=unread_only,
+        )
+        return json_response(
+            200,
+            {
+                "ok": True,
+                "profile_name": auth["profile_name"],
+                "items": items,
+            },
+        )
+
+    async def inbox_mark_read(self, request: Any):
+        auth = self._authorize(request)
+        if not auth:
+            return error_response(401, "unauthorized", "invalid access token")
+        item_id = _extract_inbox_item_id(request, "/read")
+        if not item_id:
+            return error_response(400, "bad_request", "invalid inbox item path")
+        marked = self.store.mark_inbox_item_read(
+            profile_name=auth["profile_name"],
+            item_id=item_id,
+            device_id=auth["device_id"],
+        )
+        if marked is None:
+            return error_response(404, "not_found", "inbox item not found")
+        return json_response(
+            200,
+            {
+                "ok": True,
+                "item_id": marked["id"],
+                "read_at": marked["read_at"],
             },
         )
 
@@ -477,7 +549,17 @@ class MobileRoutes:
             return error_response(404, "profile_not_found", "profile does not exist")
 
         sessions = session_db.list_sessions_rich(limit=100, offset=0)
-        payload = [self._session_summary(s) for s in sessions]
+        runtime_by_session_id = self.store.session_runtime_summaries(
+            profile_name=auth["profile_name"],
+            session_ids=[str(session.get("id") or "") for session in sessions],
+        )
+        payload = [
+            self._session_summary(
+                s,
+                runtime_summary=runtime_by_session_id.get(str(s.get("id") or "")),
+            )
+            for s in sessions
+        ]
         return json_response(
             200,
             {
@@ -523,7 +605,7 @@ class MobileRoutes:
             {
                 "ok": True,
                 "profile_name": auth["profile_name"],
-                "session": self._session_summary(created),
+                "session": self._session_summary(created, runtime_summary=None),
             },
         )
 
@@ -553,7 +635,20 @@ class MobileRoutes:
             }
             for m in messages
         ]
-        return json_response(200, {"ok": True, "session_id": session_id, "messages": payload})
+        runtime_summary = self.store.session_runtime_summary(
+            profile_name=auth["profile_name"],
+            session_id=session_id,
+        )
+        return json_response(
+            200,
+            {
+                "ok": True,
+                "session_id": session_id,
+                "messages": payload,
+                "runtime": self._runtime_payload(runtime_summary),
+                "runtime_events": runtime_summary.get("runtime_events", []) if runtime_summary else [],
+            },
+        )
 
     async def session_messages_send(self, request: Any):
         if self._shutdown_requested:
@@ -622,6 +717,13 @@ class MobileRoutes:
             "session_id": session_id,
             "created_at": time.time(),
         }
+        started_event = {
+            "id": f"{request_id}:2",
+            "type": "run.started",
+            "request_id": request_id,
+            "session_id": session_id,
+            "created_at": time.time(),
+        }
         initial_response = {
             "ok": True,
             "request_id": request_id,
@@ -631,13 +733,14 @@ class MobileRoutes:
             "stream": {
                 "transport": "sse",
                 "done": False,
-                "events": [accepted_event],
+                "events": [accepted_event, started_event],
             },
         }
 
         pending_status = "streaming" if defer_completion else "running"
         self.store.create_message_request(
             request_id=request_id,
+            profile_name=auth["profile_name"],
             session_id=session_id,
             device_id=auth["device_id"],
             client_message_id=client_message_id,
@@ -653,15 +756,16 @@ class MobileRoutes:
             key = (auth["device_id"], session_id)
             task = asyncio.create_task(
                 self._run_and_finalize(
-                    profile_name=auth["profile_name"],
-                    session_id=session_id,
-                    user_message=content,
-                    conversation_history=conversation_history,
-                    request_id=request_id,
-                    accepted_event=accepted_event,
-                    system_prompt=system_prompt,
-                    source_device_id=auth["device_id"],
-                )
+                profile_name=auth["profile_name"],
+                session_id=session_id,
+                user_message=content,
+                conversation_history=conversation_history,
+                request_id=request_id,
+                accepted_event=accepted_event,
+                started_event=started_event,
+                system_prompt=system_prompt,
+                source_device_id=auth["device_id"],
+            )
             )
             self._active_runs[key] = {
                 "request_id": request_id,
@@ -679,6 +783,7 @@ class MobileRoutes:
                 conversation_history=conversation_history,
                 request_id=request_id,
                 accepted_event=accepted_event,
+                started_event=started_event,
                 system_prompt=system_prompt,
                 device_id=auth["device_id"],
             )
@@ -691,6 +796,7 @@ class MobileRoutes:
                 conversation_history=conversation_history,
                 request_id=request_id,
                 accepted_event=accepted_event,
+                started_event=started_event,
                 system_prompt=system_prompt,
             )
         except Exception as exc:
@@ -711,18 +817,36 @@ class MobileRoutes:
             )
             return json_response(502, failed_payload)
 
+        run_status = str(run_payload.get("runtime", {}).get("runtime_status") or "completed")
         self.store.finalize_message_request(
             request_id=request_id,
-            status="completed",
+            status="waiting" if run_status == "waiting_on_human" else run_status,
             response=run_payload,
         )
-        await self._dispatch_push_notifications(
-            profile_name=auth["profile_name"],
-            source_device_id=auth["device_id"],
-            session_id=session_id,
-            request_id=request_id,
-            event_type="message.completed",
-        )
+        if run_status == "waiting_on_human":
+            await self._dispatch_runtime_notifications(
+                profile_name=auth["profile_name"],
+                source_device_id=auth["device_id"],
+                session_id=session_id,
+                request_id=request_id,
+                event_type="run.waiting",
+                runtime_status=run_status,
+                title="Hermes is waiting for you",
+                body=str(run_payload.get("runtime", {}).get("waiting_prompt") or "Open Talaria to continue the run."),
+                inbox_kind="run.waiting",
+                deep_link_target=f"session:{session_id}",
+            )
+        else:
+            await self._dispatch_runtime_notifications(
+                profile_name=auth["profile_name"],
+                source_device_id=auth["device_id"],
+                session_id=session_id,
+                request_id=request_id,
+                event_type="message.completed",
+                runtime_status=run_status,
+                title="New activity",
+                body="Hermes finished a run.",
+            )
         return json_response(202, run_payload)
 
     async def _stream_replay_response(self, request: Any, replay_payload: dict):
@@ -749,6 +873,11 @@ class MobileRoutes:
         session_id: str,
         request_id: str,
         event_type: str,
+        runtime_status: str | None = None,
+        title: str = "New activity",
+        body: str | None = None,
+        inbox_item_id: str | None = None,
+        push_mode: str | None = None,
     ) -> None:
         diagnostics = getattr(self.push_sender, "diagnostics", None)
         if not callable(diagnostics):
@@ -762,12 +891,24 @@ class MobileRoutes:
         if not targets:
             return
 
+        resolved_push_mode = push_mode or "silent_refresh"
+        aps: dict[str, Any] = {"content-available": 1}
+        if resolved_push_mode in {"visible_alert", "alert_and_inbox"}:
+            aps = {
+                "alert": {
+                    "title": title,
+                    "body": body or title,
+                },
+                "sound": "default",
+            }
         payload = {
-            "aps": {"content-available": 1},
+            "aps": aps,
             "session_id": session_id,
             "event_type": event_type,
             "unread_count": 1,
-            "title": "New activity",
+            "title": title,
+            "runtime_status": runtime_status,
+            "inbox_item_id": inbox_item_id,
         }
         for target in targets:
             try:
@@ -775,8 +916,8 @@ class MobileRoutes:
                     device_token=target["push_token"],
                     environment=target["environment"],
                     payload=payload,
-                    push_type="background",
-                    priority=5,
+                    push_type="alert" if resolved_push_mode in {"visible_alert", "alert_and_inbox"} else "background",
+                    priority=10 if resolved_push_mode in {"visible_alert", "alert_and_inbox"} else 5,
                     profile_name=profile_name,
                     session_id=session_id,
                     request_id=request_id,
@@ -801,12 +942,61 @@ class MobileRoutes:
                 session_id=session_id,
                 request_id=request_id,
                 event_type=event_type,
-                push_type="background",
+                push_type="alert" if resolved_push_mode in {"visible_alert", "alert_and_inbox"} else "background",
                 status=str(result.get("status") or ("sent" if result.get("ok") else "failed")),
                 http_status=result.get("http_status"),
                 apns_id=result.get("apns_id"),
                 error_code=result.get("error_code"),
                 response_body=result.get("response_body"),
+            )
+
+    async def _dispatch_runtime_notifications(
+        self,
+        *,
+        profile_name: str,
+        source_device_id: str,
+        session_id: str,
+        request_id: str,
+        event_type: str,
+        runtime_status: str | None = None,
+        title: str = "New activity",
+        body: str | None = None,
+        inbox_kind: str | None = None,
+        deep_link_target: str | None = None,
+    ) -> None:
+        delivery = self.store.resolve_notification_policy(
+            profile_name=profile_name,
+            event_type=event_type,
+            default_mode=_DEFAULT_NOTIFICATION_MODES.get(event_type, "none"),
+        )
+        if delivery.get("enabled") is False:
+            return
+
+        delivery_mode = str(delivery.get("delivery_mode") or "none")
+        inbox_item_id: str | None = None
+        if delivery_mode in {"inbox_only", "alert_and_inbox"}:
+            item = self.store.create_inbox_item(
+                profile_name=profile_name,
+                kind=inbox_kind or event_type,
+                title=title,
+                body=body or title,
+                session_id=session_id,
+                deep_link_target=deep_link_target,
+            )
+            inbox_item_id = str(item.get("id") or "") or None
+
+        if delivery_mode in {"silent_refresh", "visible_alert", "alert_and_inbox"}:
+            await self._dispatch_push_notifications(
+                profile_name=profile_name,
+                source_device_id=source_device_id,
+                session_id=session_id,
+                request_id=request_id,
+                event_type=event_type,
+                runtime_status=runtime_status,
+                title=title,
+                body=body,
+                inbox_item_id=inbox_item_id,
+                push_mode=delivery_mode,
             )
 
     async def _stream_live_response(
@@ -819,6 +1009,7 @@ class MobileRoutes:
         conversation_history: list[dict[str, Any]],
         request_id: str,
         accepted_event: dict,
+        started_event: dict,
         system_prompt: str | None,
         device_id: str,
     ):
@@ -831,9 +1022,10 @@ class MobileRoutes:
             },
         )
         await response.prepare(request)
-        event_log: list[dict] = [accepted_event]
+        event_log: list[dict] = [accepted_event, started_event]
         await _write_sse_event(response, accepted_event)
-        seq = 1
+        await _write_sse_event(response, started_event)
+        seq = 2
         handle = await self.profile_runtime.start_run(
             profile_name=profile_name,
             session_id=session_id,
@@ -851,6 +1043,7 @@ class MobileRoutes:
 
         disconnected = False
         completed = False
+        waiting_prompt: str | None = None
         try:
             while True:
                 try:
@@ -905,6 +1098,36 @@ class MobileRoutes:
                         break
                     continue
 
+                if kind == "waiting":
+                    waiting_prompt = str(worker_event.get("prompt") or "").strip() or None
+                    seq += 1
+                    event = {
+                        "id": f"{request_id}:{seq}",
+                        "type": "run.waiting",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "reason": str(worker_event.get("reason") or "human_input"),
+                        "prompt": waiting_prompt,
+                        "created_at": time.time(),
+                    }
+                    event_log.append(event)
+                    await _write_sse_event(response, event)
+                    continue
+
+                if kind == "resumed":
+                    waiting_prompt = None
+                    seq += 1
+                    event = {
+                        "id": f"{request_id}:{seq}",
+                        "type": "run.resumed",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "created_at": time.time(),
+                    }
+                    event_log.append(event)
+                    await _write_sse_event(response, event)
+                    continue
+
                 if kind == "failed":
                     seq += 1
                     failed_event = {
@@ -929,6 +1152,18 @@ class MobileRoutes:
                             events=event_log,
                             ok=False,
                         ),
+                    )
+                    await self._dispatch_runtime_notifications(
+                        profile_name=profile_name,
+                        source_device_id=device_id,
+                        session_id=session_id,
+                        request_id=request_id,
+                        event_type="message.failed",
+                        runtime_status="failed",
+                        title="Hermes run failed",
+                        body=str(worker_event.get("message") or "Hermes failed while running."),
+                        inbox_kind="run.failed",
+                        deep_link_target=f"session:{session_id}",
                     )
                     return response
 
@@ -968,12 +1203,15 @@ class MobileRoutes:
                             ok=True,
                         ),
                     )
-                    await self._dispatch_push_notifications(
+                    await self._dispatch_runtime_notifications(
                         profile_name=profile_name,
                         source_device_id=device_id,
                         session_id=session_id,
                         request_id=request_id,
                         event_type="message.completed",
+                        runtime_status="completed",
+                        title="New activity",
+                        body="Hermes finished a run.",
                     )
                     completed = True
                     break
@@ -983,7 +1221,31 @@ class MobileRoutes:
 
             if completed is False:
                 code, stderr = await handle.wait()
-                if code != 0:
+                if waiting_prompt:
+                    waiting_payload = self._payload_from_events(
+                        request_id=request_id,
+                        session_id=session_id,
+                        events=event_log,
+                        ok=True,
+                    )
+                    self.store.finalize_message_request(
+                        request_id=request_id,
+                        status="waiting",
+                        response=waiting_payload,
+                    )
+                    await self._dispatch_runtime_notifications(
+                        profile_name=profile_name,
+                        source_device_id=device_id,
+                        session_id=session_id,
+                        request_id=request_id,
+                        event_type="run.waiting",
+                        runtime_status="waiting_on_human",
+                        title="Hermes is waiting for you",
+                        body=waiting_prompt,
+                        inbox_kind="run.waiting",
+                        deep_link_target=f"session:{session_id}",
+                    )
+                elif code != 0:
                     failed_event = {
                         "id": f"{request_id}:{seq + 1}",
                         "type": "message.failed",
@@ -1006,6 +1268,18 @@ class MobileRoutes:
                             events=event_log,
                             ok=False,
                         ),
+                    )
+                    await self._dispatch_runtime_notifications(
+                        profile_name=profile_name,
+                        source_device_id=device_id,
+                        session_id=session_id,
+                        request_id=request_id,
+                        event_type="message.failed",
+                        runtime_status="failed",
+                        title="Hermes run failed",
+                        body=stderr or "Hermes failed while running.",
+                        inbox_kind="run.failed",
+                        deep_link_target=f"session:{session_id}",
                     )
         except (ConnectionResetError, asyncio.CancelledError):
             disconnected = True
@@ -1166,6 +1440,7 @@ class MobileRoutes:
         conversation_history: list[dict[str, Any]],
         request_id: str,
         accepted_event: dict,
+        started_event: dict,
         system_prompt: str | None,
         source_device_id: str,
     ) -> None:
@@ -1178,21 +1453,40 @@ class MobileRoutes:
                 conversation_history=conversation_history,
                 request_id=request_id,
                 accepted_event=accepted_event,
+                started_event=started_event,
                 system_prompt=system_prompt,
                 key=key,
             )
+            runtime_status = str(payload.get("runtime", {}).get("runtime_status") or "completed")
             self.store.finalize_message_request(
                 request_id=request_id,
-                status="completed",
+                status="waiting" if runtime_status == "waiting_on_human" else runtime_status,
                 response=payload,
             )
-            await self._dispatch_push_notifications(
-                profile_name=profile_name,
-                source_device_id=source_device_id,
-                session_id=session_id,
-                request_id=request_id,
-                event_type="message.completed",
-            )
+            if runtime_status == "waiting_on_human":
+                await self._dispatch_runtime_notifications(
+                    profile_name=profile_name,
+                    source_device_id=source_device_id,
+                    session_id=session_id,
+                    request_id=request_id,
+                    event_type="run.waiting",
+                    runtime_status=runtime_status,
+                    title="Hermes is waiting for you",
+                    body=str(payload.get("runtime", {}).get("waiting_prompt") or "Open Talaria to continue the run."),
+                    inbox_kind="run.waiting",
+                    deep_link_target=f"session:{session_id}",
+                )
+            else:
+                await self._dispatch_runtime_notifications(
+                    profile_name=profile_name,
+                    source_device_id=source_device_id,
+                    session_id=session_id,
+                    request_id=request_id,
+                    event_type="message.completed",
+                    runtime_status=runtime_status,
+                    title="New activity",
+                    body="Hermes finished a run.",
+                )
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -1209,6 +1503,18 @@ class MobileRoutes:
                     },
                 },
             )
+            await self._dispatch_runtime_notifications(
+                profile_name=profile_name,
+                source_device_id=source_device_id,
+                session_id=session_id,
+                request_id=request_id,
+                event_type="message.failed",
+                runtime_status="failed",
+                title="Hermes run failed",
+                body=str(exc),
+                inbox_kind="run.failed",
+                deep_link_target=f"session:{session_id}",
+            )
         finally:
             self._active_runs.pop(key, None)
 
@@ -1221,12 +1527,13 @@ class MobileRoutes:
         conversation_history: list[dict[str, Any]],
         request_id: str,
         accepted_event: dict,
+        started_event: dict,
         system_prompt: str | None,
         key: tuple[str, str] | None = None,
     ) -> dict:
         delta_events: list[dict] = []
-        tool_events: list[dict] = []
-        seq = 1
+        runtime_events: list[dict] = [started_event]
+        seq = 2
         handle = await self.profile_runtime.start_run(
             profile_name=profile_name,
             session_id=session_id,
@@ -1241,6 +1548,7 @@ class MobileRoutes:
 
         final_text = ""
         usage: dict[str, Any] = {}
+        waiting_prompt: str | None = None
         while True:
             worker_event = await handle.read_event()
             if worker_event is None:
@@ -1261,7 +1569,7 @@ class MobileRoutes:
                 continue
             if kind == "tool":
                 seq += 1
-                tool_events.append(
+                runtime_events.append(
                     {
                         "id": f"{request_id}:{seq}",
                         "type": str(worker_event.get("type") or "tool.progress"),
@@ -1271,6 +1579,34 @@ class MobileRoutes:
                         "preview": worker_event.get("preview"),
                         "args": worker_event.get("args"),
                         "meta": worker_event.get("meta") or {},
+                        "created_at": time.time(),
+                    }
+                )
+                continue
+            if kind == "waiting":
+                seq += 1
+                waiting_prompt = str(worker_event.get("prompt") or "").strip() or None
+                runtime_events.append(
+                    {
+                        "id": f"{request_id}:{seq}",
+                        "type": "run.waiting",
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "reason": str(worker_event.get("reason") or "human_input"),
+                        "prompt": waiting_prompt,
+                        "created_at": time.time(),
+                    }
+                )
+                continue
+            if kind == "resumed":
+                seq += 1
+                waiting_prompt = None
+                runtime_events.append(
+                    {
+                        "id": f"{request_id}:{seq}",
+                        "type": "run.resumed",
+                        "request_id": request_id,
+                        "session_id": session_id,
                         "created_at": time.time(),
                     }
                 )
@@ -1307,12 +1643,24 @@ class MobileRoutes:
             "usage": usage or {},
             "created_at": time.time(),
         }
-        events = [accepted_event, *tool_events, *delta_events, completed_event]
+        events = [accepted_event, *runtime_events, *delta_events]
+        runtime_status = "completed"
+        if waiting_prompt:
+            runtime_status = "waiting_on_human"
+        else:
+            events.append(completed_event)
         return {
             "ok": True,
             "request_id": request_id,
             "session_id": session_id,
             "idempotency_replayed": False,
+            "runtime": {
+                "active_run_request_id": request_id if runtime_status == "waiting_on_human" else None,
+                "runtime_status": runtime_status,
+                "waiting_prompt": waiting_prompt,
+                "last_runtime_activity_at": int(time.time()),
+            },
+            "runtime_events": runtime_events,
             "stream": {
                 "transport": "sse",
                 "done": True,
@@ -1329,7 +1677,22 @@ class MobileRoutes:
             return None
         return payload
 
-    def _session_summary(self, session: dict[str, Any]) -> dict[str, Any]:
+    def _runtime_payload(self, runtime_summary: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not runtime_summary:
+            return None
+        return {
+            "active_run_request_id": runtime_summary.get("active_run_request_id"),
+            "runtime_status": runtime_summary.get("runtime_status"),
+            "waiting_prompt": runtime_summary.get("waiting_prompt"),
+            "last_runtime_activity_at": runtime_summary.get("last_runtime_activity_at"),
+        }
+
+    def _session_summary(
+        self,
+        session: dict[str, Any],
+        *,
+        runtime_summary: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         preview_text = str(session.get("preview_text") or session.get("preview") or "").strip()
         title = str(session.get("title") or "").strip()
         title_source = str(session.get("title_source") or "").strip()
@@ -1350,6 +1713,7 @@ class MobileRoutes:
             "updated_at": session.get("last_active") or session.get("started_at"),
             "message_count": session.get("message_count", 0),
             "unread_count": int(session.get("unread_count", 0) or 0),
+            "runtime": self._runtime_payload(runtime_summary),
         }
 
     async def shutdown(self) -> None:

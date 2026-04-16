@@ -207,6 +207,123 @@ class MobileOperatorSurface:
             channel=channel,
         )
 
+    def get_notification_policy(
+        self,
+        *,
+        profile_name: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_profile = str(profile_name or "").strip() or self.config.profile_name
+        return {
+            "ok": True,
+            "profile_name": resolved_profile,
+            "device_id": str(device_id or "").strip() or None,
+            "policies": self.store.list_notification_policies(
+                profile_name=resolved_profile,
+                device_id=device_id,
+            ),
+        }
+
+    def set_notification_policy(
+        self,
+        *,
+        event_type: str,
+        delivery_mode: str,
+        enabled: bool = True,
+        profile_name: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_profile = str(profile_name or "").strip() or self.config.profile_name
+        normalized_event_type = str(event_type or "").strip()
+        normalized_delivery_mode = str(delivery_mode or "").strip()
+        if not normalized_event_type:
+            return _error_payload("bad_request", "event_type is required")
+        if not normalized_delivery_mode:
+            return _error_payload("bad_request", "delivery_mode is required")
+        policy = self.store.set_notification_policy(
+            profile_name=resolved_profile,
+            event_type=normalized_event_type,
+            delivery_mode=normalized_delivery_mode,
+            enabled=bool(enabled),
+            device_id=device_id,
+        )
+        return {
+            "ok": True,
+            "policy": policy,
+        }
+
+    def send_inbox_item(
+        self,
+        *,
+        title: str,
+        body: str,
+        kind: str = "agent.message",
+        session_id: str | None = None,
+        deep_link_target: str | None = None,
+        profile_name: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_profile = str(profile_name or "").strip() or self.config.profile_name
+        normalized_title = str(title or "").strip()
+        normalized_body = str(body or "").strip()
+        if not normalized_title:
+            return _error_payload("bad_request", "title is required")
+        if not normalized_body:
+            return _error_payload("bad_request", "body is required")
+        item = self.store.create_inbox_item(
+            profile_name=resolved_profile,
+            kind=str(kind or "agent.message").strip() or "agent.message",
+            title=normalized_title,
+            body=normalized_body,
+            session_id=str(session_id or "").strip() or None,
+            deep_link_target=str(deep_link_target or "").strip() or None,
+            device_id=str(device_id or "").strip() or None,
+        )
+        return {
+            "ok": True,
+            "item": item,
+        }
+
+    def list_inbox_items(
+        self,
+        *,
+        profile_name: str | None = None,
+        device_id: str | None = None,
+        unread_only: bool = False,
+    ) -> dict[str, Any]:
+        resolved_profile = str(profile_name or "").strip() or self.config.profile_name
+        return {
+            "ok": True,
+            "profile_name": resolved_profile,
+            "device_id": str(device_id or "").strip() or None,
+            "items": self.store.list_inbox_items(
+                profile_name=resolved_profile,
+                device_id=device_id,
+                unread_only=bool(unread_only),
+            ),
+        }
+
+    def notify(
+        self,
+        *,
+        title: str,
+        body: str,
+        kind: str = "agent.message",
+        session_id: str | None = None,
+        deep_link_target: str | None = None,
+        profile_name: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.send_inbox_item(
+            title=title,
+            body=body,
+            kind=kind,
+            session_id=session_id,
+            deep_link_target=deep_link_target,
+            profile_name=profile_name,
+            device_id=device_id,
+        )
+
 
 def _pairing_tool_schema() -> dict[str, Any]:
     return {
@@ -271,6 +388,73 @@ def _connection_bundle_tool_schema() -> dict[str, Any]:
                 },
             },
             "required": ["base_url"],
+        },
+    }
+
+
+def _notification_policy_get_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "mobile_get_notification_policy",
+        "description": "List hermes-mobile notification policy rows for a profile or device.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "profile_name": {"type": "string"},
+                "device_id": {"type": "string"},
+            },
+        },
+    }
+
+
+def _notification_policy_set_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "mobile_set_notification_policy",
+        "description": "Set a hermes-mobile notification delivery rule for an event type.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "profile_name": {"type": "string"},
+                "device_id": {"type": "string"},
+                "event_type": {"type": "string"},
+                "delivery_mode": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["event_type", "delivery_mode"],
+        },
+    }
+
+
+def _send_inbox_item_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "mobile_send_inbox_item",
+        "description": "Create a durable Talaria inbox item for a profile or device.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "profile_name": {"type": "string"},
+                "device_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "deep_link_target": {"type": "string"},
+                "kind": {"type": "string"},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["title", "body"],
+        },
+    }
+
+
+def _list_inbox_items_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "mobile_list_inbox_items",
+        "description": "List durable Talaria inbox items.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "profile_name": {"type": "string"},
+                "device_id": {"type": "string"},
+                "unread_only": {"type": "boolean"},
+            },
         },
     }
 
@@ -360,6 +544,70 @@ def register_operator_surface(context: Any, surface: MobileOperatorSurface) -> N
                 channel=(args or {}).get("channel"),
             ),
             description="Verify hermes-mobile, generate a pairing code, and return a pasteable Talaria connection bundle.",
+        )
+        register_tool(
+            name="mobile_get_notification_policy",
+            toolset=PLUGIN_TOOLSET,
+            schema=_notification_policy_get_tool_schema(),
+            handler=lambda args, **_kwargs: surface.get_notification_policy(
+                profile_name=(args or {}).get("profile_name"),
+                device_id=(args or {}).get("device_id"),
+            ),
+            description="List hermes-mobile notification policy rows.",
+        )
+        register_tool(
+            name="mobile_set_notification_policy",
+            toolset=PLUGIN_TOOLSET,
+            schema=_notification_policy_set_tool_schema(),
+            handler=lambda args, **_kwargs: surface.set_notification_policy(
+                profile_name=(args or {}).get("profile_name"),
+                device_id=(args or {}).get("device_id"),
+                event_type=(args or {}).get("event_type", ""),
+                delivery_mode=(args or {}).get("delivery_mode", ""),
+                enabled=bool((args or {}).get("enabled", True)),
+            ),
+            description="Set a hermes-mobile notification rule.",
+        )
+        register_tool(
+            name="mobile_send_inbox_item",
+            toolset=PLUGIN_TOOLSET,
+            schema=_send_inbox_item_tool_schema(),
+            handler=lambda args, **_kwargs: surface.send_inbox_item(
+                profile_name=(args or {}).get("profile_name"),
+                device_id=(args or {}).get("device_id"),
+                session_id=(args or {}).get("session_id"),
+                deep_link_target=(args or {}).get("deep_link_target"),
+                kind=(args or {}).get("kind", "agent.message"),
+                title=(args or {}).get("title", ""),
+                body=(args or {}).get("body", ""),
+            ),
+            description="Create a durable Talaria inbox item.",
+        )
+        register_tool(
+            name="mobile_list_inbox_items",
+            toolset=PLUGIN_TOOLSET,
+            schema=_list_inbox_items_tool_schema(),
+            handler=lambda args, **_kwargs: surface.list_inbox_items(
+                profile_name=(args or {}).get("profile_name"),
+                device_id=(args or {}).get("device_id"),
+                unread_only=bool((args or {}).get("unread_only", False)),
+            ),
+            description="List durable Talaria inbox items.",
+        )
+        register_tool(
+            name="mobile_notify",
+            toolset=PLUGIN_TOOLSET,
+            schema=_send_inbox_item_tool_schema(),
+            handler=lambda args, **_kwargs: surface.notify(
+                profile_name=(args or {}).get("profile_name"),
+                device_id=(args or {}).get("device_id"),
+                session_id=(args or {}).get("session_id"),
+                deep_link_target=(args or {}).get("deep_link_target"),
+                kind=(args or {}).get("kind", "agent.message"),
+                title=(args or {}).get("title", ""),
+                body=(args or {}).get("body", ""),
+            ),
+            description="Create a durable Talaria inbox item for agent notification use.",
         )
 
     register_cli_command = getattr(context, "register_cli_command", None)

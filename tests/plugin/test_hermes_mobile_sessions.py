@@ -258,6 +258,89 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages_payload["messages"][1]["role"], "assistant")
         self.assertIn("Hermes response", messages_payload["messages"][1]["content"])
 
+    async def test_waiting_run_exposes_runtime_summary_and_events(self):
+        send = self.route("POST", "/mobile/sessions/{session_id}/messages")
+        session_id = "session-waiting"
+        send_status, send_payload = response_json(
+            await send(
+                self.request(
+                    "POST",
+                    f"/mobile/sessions/{session_id}/messages",
+                    session_id=session_id,
+                    headers=self.auth_headers(),
+                    body={
+                        "client_message_id": "client-waiting-1",
+                        "content": "Needs answer about deployment target",
+                    },
+                )
+            )
+        )
+        self.assertEqual(send_status, 202)
+        self.assertEqual(send_payload["ok"], True)
+        self.assertEqual(send_payload["runtime"]["runtime_status"], "waiting_on_human")
+        self.assertEqual(send_payload["runtime"]["waiting_prompt"], "What should Hermes do next?")
+        event_types = [event["type"] for event in send_payload["stream"]["events"]]
+        self.assertEqual(event_types[:2], ["message.accepted", "run.started"])
+        self.assertIn("tool.started", event_types)
+        self.assertIn("tool.completed", event_types)
+        self.assertIn("run.waiting", event_types)
+        self.assertNotIn("message.completed", event_types)
+
+        sessions = self.route("GET", "/mobile/sessions")
+        sessions_status, sessions_payload = response_json(
+            await sessions(
+                self.request(
+                    "GET",
+                    "/mobile/sessions",
+                    headers=self.auth_headers(),
+                )
+            )
+        )
+        self.assertEqual(sessions_status, 200)
+        self.assertEqual(sessions_payload["sessions"][0]["runtime"]["runtime_status"], "waiting_on_human")
+        self.assertEqual(
+            sessions_payload["sessions"][0]["runtime"]["waiting_prompt"],
+            "What should Hermes do next?",
+        )
+
+        messages = self.route("GET", "/mobile/sessions/{session_id}/messages")
+        messages_status, messages_payload = response_json(
+            await messages(
+                self.request(
+                    "GET",
+                    f"/mobile/sessions/{session_id}/messages",
+                    session_id=session_id,
+                    headers=self.auth_headers(),
+                )
+            )
+        )
+        self.assertEqual(messages_status, 200)
+        self.assertEqual(messages_payload["runtime"]["runtime_status"], "waiting_on_human")
+        self.assertEqual(messages_payload["runtime"]["waiting_prompt"], "What should Hermes do next?")
+        self.assertEqual(
+            [event["type"] for event in messages_payload["runtime_events"]],
+            ["run.started", "tool.started", "tool.completed", "run.waiting"],
+        )
+
+        inbox = self.route("GET", "/mobile/inbox")
+        inbox_status, inbox_payload = response_json(
+            await inbox(
+                self.request(
+                    "GET",
+                    "/mobile/inbox",
+                    headers=self.auth_headers(),
+                )
+            )
+        )
+        self.assertEqual(inbox_status, 200)
+        self.assertEqual(len(inbox_payload["items"]), 1)
+        self.assertEqual(inbox_payload["items"][0]["kind"], "run.waiting")
+        self.assertEqual(inbox_payload["items"][0]["session_id"], session_id)
+        self.assertEqual(
+            inbox_payload["items"][0]["deep_link_target"],
+            f"session:{session_id}",
+        )
+
     async def test_create_session_returns_shell_and_lists_it(self):
         create_session = self.route("POST", "/mobile/sessions")
         sessions = self.route("GET", "/mobile/sessions")
