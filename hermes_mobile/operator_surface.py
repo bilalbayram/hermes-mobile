@@ -9,7 +9,7 @@ from .config import MobilePluginConfig
 from .runtime import HermesProfileRuntime
 from .store import MobileAuthStore
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 PLUGIN_TOOLSET = "plugin_hermes_mobile"
 STABLE_CHANNEL = "stable"
 PLUGIN_REPOSITORY = "github.com/bilalbayram/hermes-mobile"

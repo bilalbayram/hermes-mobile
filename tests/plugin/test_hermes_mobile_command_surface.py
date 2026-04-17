@@ -76,7 +76,7 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["status"], "verified")
         self.assertEqual(payload["install_channel"], "stable")
         self.assertEqual(payload["repository"], "github.com/bilalbayram/hermes-mobile")
-        self.assertEqual(payload["version"], "0.1.0")
+        self.assertEqual(payload["version"], "0.2.0")
 
     def test_install_or_verify_rejects_non_stable_channel(self):
         handler = self.ctx.tools["mobile_install_or_verify"]["handler"]
@@ -159,7 +159,7 @@ class HermesMobileCommandSurfaceTests(unittest.IsolatedAsyncioTestCase):
             "status": "verified",
             "install_channel": channel or "stable",
             "repository": "github.com/bilalbayram/hermes-mobile",
-            "version": "0.1.0",
+            "version": "0.2.0",
         }
         surface.generate_pairing_code = lambda profile_name=None: {
             "ok": True,
