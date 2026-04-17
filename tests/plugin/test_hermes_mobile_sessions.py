@@ -403,6 +403,45 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created["title"], "New Chat")
         self.assertEqual(created["title_source"], "fallback_new_chat")
 
+    async def test_create_session_with_blank_title_allows_multiple_fallback_labels(self):
+        conn = sqlite3.connect(self.env.db_path)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
+            ON sessions(title) WHERE title IS NOT NULL
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        create_session = self.route("POST", "/mobile/sessions")
+
+        first_status, first_payload = response_json(
+            await create_session(
+                self.request(
+                    "POST",
+                    "/mobile/sessions",
+                    headers=self.auth_headers(),
+                    body={"title": ""},
+                )
+            )
+        )
+        second_status, second_payload = response_json(
+            await create_session(
+                self.request(
+                    "POST",
+                    "/mobile/sessions",
+                    headers=self.auth_headers(),
+                    body={"title": "   "},
+                )
+            )
+        )
+
+        self.assertEqual(first_status, 201)
+        self.assertEqual(second_status, 201)
+        self.assertEqual(first_payload["session"]["title"], "New Chat")
+        self.assertEqual(second_payload["session"]["title"], "New Chat")
+
     async def test_send_with_stream_true_returns_sse_response(self):
         send = self.route("POST", "/mobile/sessions/{session_id}/messages")
         session_id = "session-sse-live"

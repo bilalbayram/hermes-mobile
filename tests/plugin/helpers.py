@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -259,15 +260,16 @@ class FakeSessionDB:
         source: str = "mobile",
         title: str | None = None,
     ) -> dict | None:
-        resolved_session_id = str(session_id or "").strip() or f"session-{int(time.time() * 1000)}"
+        resolved_session_id = str(session_id or "").strip() or str(uuid.uuid4())
         if "/" in resolved_session_id:
             return None
         now = time.time()
-        resolved_title = _normalize_text(str(title or ""))
-        if resolved_title:
+        requested_title = _normalize_text(str(title or ""))
+        persisted_title = requested_title or None
+        if requested_title:
             title_source = "metadata"
         else:
-            resolved_title = "New Chat"
+            requested_title = "New Chat"
             title_source = "fallback_new_chat"
         conn = self._conn()
         try:
@@ -280,7 +282,7 @@ class FakeSessionDB:
                     resolved_session_id,
                     source,
                     now,
-                    resolved_title,
+                    persisted_title,
                 ),
             )
             conn.commit()
@@ -291,7 +293,7 @@ class FakeSessionDB:
         return {
             "id": resolved_session_id,
             "source": source,
-            "title": resolved_title,
+            "title": requested_title,
             "title_source": title_source,
             "preview_text": "",
             "preview": "",

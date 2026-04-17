@@ -123,11 +123,12 @@ class SQLiteSessionView:
         if "/" in resolved_session_id:
             return None
 
-        resolved_title = _normalize_text(str(title or ""))
-        if resolved_title:
+        requested_title = _normalize_text(str(title or ""))
+        persisted_title = requested_title or None
+        if requested_title:
             title_source = "metadata"
         else:
-            resolved_title = "New Chat"
+            requested_title = "New Chat"
             title_source = "fallback_new_chat"
         conn = self._connect()
         try:
@@ -140,7 +141,7 @@ class SQLiteSessionView:
                     resolved_session_id,
                     source,
                     now,
-                    resolved_title or None,
+                    persisted_title,
                 ),
             )
             conn.commit()
@@ -153,7 +154,7 @@ class SQLiteSessionView:
         return {
             "id": resolved_session_id,
             "source": source,
-            "title": resolved_title,
+            "title": requested_title,
             "preview_text": "",
             "last_active": now,
             "started_at": now,
