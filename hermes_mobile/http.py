@@ -41,9 +41,65 @@ except ModuleNotFoundError:
         async def write_eof(self) -> None:
             return None
 
+    class _CompatWSMsgType:
+        TEXT = "text"
+        ERROR = "error"
+        CLOSE = "close"
+        CLOSED = "closed"
+        CLOSING = "closing"
+
+    class _CompatWSMessage:
+        def __init__(self, type: str, data: str | None = None):
+            self.type = type
+            self.data = data
+
+    class _CompatWebSocketResponse(_CompatResponse):
+        def __init__(
+            self,
+            *,
+            heartbeat: float | None = None,
+            autoping: bool = True,
+        ):
+            del heartbeat, autoping
+            super().__init__(status=101, text="", content_type="application/websocket", headers={})
+            self.closed = False
+            self.close_code: int | None = None
+            self.sent_messages: list[dict[str, Any]] = []
+            self._incoming_messages: list[Any] = []
+
+        async def prepare(self, request: Any) -> "_CompatWebSocketResponse":
+            self._incoming_messages = list(getattr(request, "ws_messages", []) or [])
+            return self
+
+        async def receive(self) -> "_CompatWSMessage":
+            if self.closed:
+                return _CompatWSMessage(_CompatWSMsgType.CLOSED)
+            if self._incoming_messages:
+                message = self._incoming_messages.pop(0)
+                if isinstance(message, bytes):
+                    payload = message.decode("utf-8")
+                elif isinstance(message, str):
+                    payload = message
+                else:
+                    payload = json.dumps(message)
+                return _CompatWSMessage(_CompatWSMsgType.TEXT, payload)
+            self.closed = True
+            return _CompatWSMessage(_CompatWSMsgType.CLOSE)
+
+        async def send_json(self, data: dict[str, Any]) -> None:
+            self.sent_messages.append(data)
+            self.text += json.dumps(data) + "\n"
+
+        async def close(self, *, code: int = 1000, message: bytes = b"") -> None:
+            del message
+            self.closed = True
+            self.close_code = code
+
     class _CompatWeb:
         Response = _CompatResponse
         StreamResponse = _CompatStreamResponse
+        WebSocketResponse = _CompatWebSocketResponse
+        WSMsgType = _CompatWSMsgType
 
         @staticmethod
         def json_response(data: dict, *, status: int = 200):

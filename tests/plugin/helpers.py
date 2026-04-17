@@ -155,6 +155,7 @@ class FakeRequest:
     app: dict[Any, Any]
     match_info: dict[str, str]
     post_data: dict[str, Any] | None = None
+    ws_messages: list[Any] | None = None
 
     async def json(self) -> dict:
         return self.body

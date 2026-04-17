@@ -49,6 +49,7 @@ class HermesMobileAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_registers_routes_and_startup(self):
         self.assertGreaterEqual(len(self.ctx.startup_callbacks), 1)
         self.assertIn(("GET", "/mobile/capabilities"), self.ctx.routes)
+        self.assertIn(("GET", "/mobile/ws"), self.ctx.routes)
         self.assertIn(("POST", "/mobile/pair/start"), self.ctx.routes)
         self.assertIn(("POST", "/mobile/pair/complete"), self.ctx.routes)
         self.assertIn(("POST", "/mobile/auth/refresh"), self.ctx.routes)
@@ -76,8 +77,12 @@ class HermesMobileAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["features"]["sessions_list"], True)
         self.assertEqual(payload["features"]["sessions_create"], True)
         self.assertEqual(payload["features"]["messages_send"], True)
+        self.assertEqual(payload["features"]["realtime_ws"], True)
         self.assertEqual(payload["pairing"]["code_format"], "XXXX-XXXX")
         self.assertEqual(payload["pairing"]["install_channel"], "stable")
+        self.assertEqual(payload["realtime"]["transport"], "websocket")
+        self.assertEqual(payload["realtime"]["path"], "/mobile/ws")
+        self.assertEqual(payload["realtime"]["protocol_version"], 1)
         self.assertEqual(payload["scope"]["mode"], "profile_state_db")
         self.assertEqual(payload["scope"]["default_profile"], "default")
 
@@ -223,7 +228,7 @@ class HermesMobileAuthTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         conn.close()
         self.assertIsNotNone(row)
-        self.assertEqual(int(row["value"]), 5)
+        self.assertEqual(int(row["value"]), 6)
         self.assertEqual(device_row["platform"], "ios")
         self.assertIsNone(device_row["app_version"])
 

@@ -56,6 +56,7 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
         body=None,
         headers=None,
         session_id: str | None = None,
+        ws_messages=None,
     ) -> FakeRequest:
         match_info = {"session_id": session_id} if session_id else {}
         return FakeRequest(
@@ -65,6 +66,7 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
             body=body or {},
             app={},
             match_info=match_info,
+            ws_messages=ws_messages,
         )
 
     def auth_headers(self):
@@ -426,6 +428,33 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
         event_types = [event["type"] for event in events]
         self.assertIn("message.delta", event_types)
         self.assertEqual(events[-1]["type"], "message.completed")
+
+    async def test_websocket_send_streams_runtime_events(self):
+        websocket_handler = self.route("GET", "/mobile/ws")
+        response = await websocket_handler(
+            self.request(
+                "GET",
+                "/mobile/ws",
+                headers=self.auth_headers(),
+                ws_messages=[
+                    {
+                        "type": "message.send",
+                        "session_id": "session-ws-live",
+                        "client_message_id": "ws-1",
+                        "content": "Stream me over websocket",
+                        "attachment_ids": [],
+                    }
+                ],
+            )
+        )
+
+        self.assertEqual(response.status, 101)
+        self.assertGreaterEqual(len(response.sent_messages), 4)
+        self.assertEqual(response.sent_messages[0]["type"], "connection.ready")
+        event_types = [message["type"] for message in response.sent_messages[1:]]
+        self.assertEqual(event_types[0], "message.accepted")
+        self.assertIn("message.delta", event_types)
+        self.assertEqual(event_types[-1], "message.completed")
 
     async def test_stream_replay_uses_sse_and_does_not_rerun_agent(self):
         send = self.route("POST", "/mobile/sessions/{session_id}/messages")

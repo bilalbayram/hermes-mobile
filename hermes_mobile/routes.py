@@ -169,6 +169,7 @@ class MobileRoutes:
 
     def register(self, route_registrar: Callable[[str, str, Callable], None]) -> None:
         route_registrar("GET", "/mobile/capabilities", self.capabilities)
+        route_registrar("GET", "/mobile/ws", self.realtime_websocket)
         route_registrar("POST", "/mobile/pair/start", self.pair_start)
         route_registrar("POST", "/mobile/pair/complete", self.pair_complete)
         route_registrar("POST", "/mobile/auth/refresh", self.auth_refresh)
@@ -213,10 +214,17 @@ class MobileRoutes:
                     "inbox_list": True,
                     "inbox_mark_read": True,
                     "uploads": True,
+                    "realtime_ws": True,
                 },
                 "pairing": {
                     "code_format": "XXXX-XXXX",
                     "install_channel": "stable",
+                },
+                "realtime": {
+                    "transport": "websocket",
+                    "path": "/mobile/ws",
+                    "protocol_version": 1,
+                    "heartbeat_interval_seconds": 25,
                 },
                 "scope": {
                     "mode": "profile_state_db",
@@ -650,38 +658,232 @@ class MobileRoutes:
             },
         )
 
-    async def session_messages_send(self, request: Any):
+    async def realtime_websocket(self, request: Any):
+        websocket = web.WebSocketResponse(heartbeat=30.0, autoping=True)
+        await websocket.prepare(request)
+
         if self._shutdown_requested:
-            return error_response(503, "unavailable", "plugin is shutting down")
+            await self._write_ws_error(
+                websocket,
+                "unavailable",
+                "plugin is shutting down",
+            )
+            await websocket.close(code=1013)
+            return websocket
+
         auth = self._authorize(request)
         if not auth:
-            return error_response(401, "unauthorized", "invalid access token")
+            await self._write_ws_error(
+                websocket,
+                "unauthorized",
+                "invalid access token",
+            )
+            await websocket.close(code=1008)
+            return websocket
+
         session_db = self.profile_runtime.session_view(auth["profile_name"])
         if session_db is None:
-            return error_response(404, "profile_not_found", "profile does not exist")
+            await self._write_ws_error(
+                websocket,
+                "profile_not_found",
+                "profile does not exist",
+            )
+            await websocket.close(code=1008)
+            return websocket
 
-        session_id = _extract_session_id(request, "/messages")
+        await websocket.send_json(
+            {
+                "type": "connection.ready",
+                "profile_name": auth["profile_name"],
+                "heartbeat_interval_seconds": 25,
+                "protocol_version": 1,
+                "server_time": time.time(),
+            }
+        )
+
+        while True:
+            message = await websocket.receive()
+            if message.type in (
+                web.WSMsgType.CLOSE,
+                web.WSMsgType.CLOSED,
+                web.WSMsgType.CLOSING,
+                web.WSMsgType.ERROR,
+            ):
+                break
+            if message.type != web.WSMsgType.TEXT:
+                await self._write_ws_error(
+                    websocket,
+                    "bad_request",
+                    "unsupported websocket payload",
+                )
+                continue
+            try:
+                body = json.loads(message.data or "{}")
+            except Exception:
+                await self._write_ws_error(
+                    websocket,
+                    "bad_request",
+                    "invalid websocket payload",
+                )
+                continue
+            if not isinstance(body, dict):
+                await self._write_ws_error(
+                    websocket,
+                    "bad_request",
+                    "invalid websocket payload",
+                )
+                continue
+
+            message_type = str(body.get("type", "")).strip()
+            if message_type == "ping":
+                await websocket.send_json(
+                    {
+                        "type": "connection.pong",
+                        "timestamp": time.time(),
+                    }
+                )
+                continue
+            if message_type != "message.send":
+                await self._write_ws_error(
+                    websocket,
+                    "bad_request",
+                    "unsupported websocket command",
+                    client_message_id=str(body.get("client_message_id", "")).strip() or None,
+                )
+                continue
+
+            session_id = str(body.get("session_id", "")).strip()
+            prepared = await self._prepare_message_send(
+                profile_name=auth["profile_name"],
+                device_id=auth["device_id"],
+                session_id=session_id,
+                body=body,
+                transport="websocket",
+            )
+            error_info = prepared.get("error")
+            if error_info is not None:
+                await self._write_ws_error(
+                    websocket,
+                    str(error_info["code"]),
+                    str(error_info["message"]),
+                    client_message_id=error_info.get("client_message_id"),
+                )
+                continue
+
+            replay = prepared.get("replay")
+            replay_status = str(prepared.get("replay_status") or "")
+            if replay is not None:
+                events = replay.get("stream", {}).get("events", [])
+                if replay_status in ("pending", "running", "streaming"):
+                    await self._write_ws_error(
+                        websocket,
+                        "request_in_progress",
+                        "request is already running",
+                        client_message_id=str(prepared.get("client_message_id") or "") or None,
+                    )
+                    continue
+                for event in events:
+                    await websocket.send_json(event)
+                continue
+
+            if bool(prepared["defer_completion"]):
+                await self._write_ws_error(
+                    websocket,
+                    "bad_request",
+                    "defer_completion is not supported over websocket",
+                    client_message_id=str(prepared["client_message_id"]),
+                )
+                continue
+
+            await self._run_live_stream(
+                emit_event=websocket.send_json,
+                emit_keepalive=None,
+                transport="websocket",
+                profile_name=str(prepared["profile_name"]),
+                session_id=str(prepared["session_id"]),
+                user_message=str(prepared["content"]),
+                conversation_history=list(prepared["conversation_history"]),
+                request_id=str(prepared["request_id"]),
+                accepted_event=dict(prepared["accepted_event"]),
+                started_event=dict(prepared["started_event"]),
+                system_prompt=prepared.get("system_prompt"),
+                device_id=str(prepared["device_id"]),
+            )
+
+        return websocket
+
+    async def _prepare_message_send(
+        self,
+        *,
+        profile_name: str,
+        device_id: str,
+        session_id: str,
+        body: dict[str, Any],
+        transport: str,
+    ) -> dict[str, Any]:
+        session_db = self.profile_runtime.session_view(profile_name)
+        if session_db is None:
+            return {
+                "error": {
+                    "status": 404,
+                    "code": "profile_not_found",
+                    "message": "profile does not exist",
+                }
+            }
+
         if not session_id:
-            return error_response(400, "bad_request", "invalid session path")
+            return {
+                "error": {
+                    "status": 400,
+                    "code": "bad_request",
+                    "message": "invalid session path",
+                }
+            }
 
-        body = await _json_body(request)
         client_message_id = str(body.get("client_message_id", "")).strip()
         content = str(body.get("content", "")).strip()
         defer_completion = bool(body.get("defer_completion", False))
         stream_requested = bool(body.get("stream", False))
         attachment_ids = _extract_attachment_ids(body)
         if not client_message_id:
-            return error_response(400, "bad_request", "client_message_id is required")
+            return {
+                "error": {
+                    "status": 400,
+                    "code": "bad_request",
+                    "message": "client_message_id is required",
+                }
+            }
         if not content:
-            return error_response(400, "bad_request", "content is required")
+            return {
+                "error": {
+                    "status": 400,
+                    "code": "bad_request",
+                    "message": "content is required",
+                    "client_message_id": client_message_id,
+                }
+            }
         if attachment_ids is None:
-            return error_response(400, "bad_request", "attachment_ids must be a list of ids")
+            return {
+                "error": {
+                    "status": 400,
+                    "code": "bad_request",
+                    "message": "attachment_ids must be a list of ids",
+                    "client_message_id": client_message_id,
+                }
+            }
         if self.store.resolve_uploads(
-            profile_name=auth["profile_name"],
+            profile_name=profile_name,
             attachment_ids=attachment_ids,
             session_id=session_id,
         ) is None:
-            return error_response(404, "attachment_not_found", "attachment not found")
+            return {
+                "error": {
+                    "status": 404,
+                    "code": "attachment_not_found",
+                    "message": "attachment not found",
+                    "client_message_id": client_message_id,
+                }
+            }
 
         payload_hash = self.store.request_payload_hash(
             content=content,
@@ -690,24 +892,27 @@ class MobileRoutes:
         )
         existing = self.store.get_message_request(
             session_id=session_id,
-            device_id=auth["device_id"],
+            device_id=device_id,
             client_message_id=client_message_id,
         )
         if existing:
             if existing["payload_hash"] != payload_hash:
-                return error_response(
-                    409,
-                    "idempotency_conflict",
-                    "client_message_id was already used with different payload",
-                )
+                return {
+                    "error": {
+                        "status": 409,
+                        "code": "idempotency_conflict",
+                        "message": "client_message_id was already used with different payload",
+                        "client_message_id": client_message_id,
+                    }
+                }
             replay = existing["response"] or {"ok": True, "session_id": session_id}
             replay["idempotency_replayed"] = True
-            replay_status = existing.get("status", "")
-            if stream_requested and replay_status not in ("pending", "running", "streaming"):
-                return await self._stream_replay_response(request, replay)
-            if replay_status in ("pending", "running", "streaming"):
-                return json_response(202, replay)
-            return json_response(200, replay)
+            return {
+                "replay": replay,
+                "replay_status": existing.get("status", ""),
+                "stream_requested": stream_requested,
+                "client_message_id": client_message_id,
+            }
 
         request_id = str(uuid.uuid4())
         accepted_event = {
@@ -715,6 +920,7 @@ class MobileRoutes:
             "type": "message.accepted",
             "request_id": request_id,
             "session_id": session_id,
+            "client_message_id": client_message_id,
             "created_at": time.time(),
         }
         started_event = {
@@ -731,7 +937,7 @@ class MobileRoutes:
             "client_message_id": client_message_id,
             "idempotency_replayed": False,
             "stream": {
-                "transport": "sse",
+                "transport": transport,
                 "done": False,
                 "events": [accepted_event, started_event],
             },
@@ -740,70 +946,116 @@ class MobileRoutes:
         pending_status = "streaming" if defer_completion else "running"
         self.store.create_message_request(
             request_id=request_id,
-            profile_name=auth["profile_name"],
+            profile_name=profile_name,
             session_id=session_id,
-            device_id=auth["device_id"],
+            device_id=device_id,
             client_message_id=client_message_id,
             request_payload_hash=payload_hash,
             status=pending_status,
             response=initial_response,
         )
 
-        system_prompt = self._session_system_prompt(session_db, session_id)
-        conversation_history = session_db.get_messages_as_conversation(session_id)
+        return {
+            "profile_name": profile_name,
+            "device_id": device_id,
+            "session_id": session_id,
+            "client_message_id": client_message_id,
+            "content": content,
+            "defer_completion": defer_completion,
+            "stream_requested": stream_requested,
+            "request_id": request_id,
+            "accepted_event": accepted_event,
+            "started_event": started_event,
+            "initial_response": initial_response,
+            "system_prompt": self._session_system_prompt(session_db, session_id),
+            "conversation_history": session_db.get_messages_as_conversation(session_id),
+        }
 
-        if defer_completion:
-            key = (auth["device_id"], session_id)
+    async def session_messages_send(self, request: Any):
+        if self._shutdown_requested:
+            return error_response(503, "unavailable", "plugin is shutting down")
+        auth = self._authorize(request)
+        if not auth:
+            return error_response(401, "unauthorized", "invalid access token")
+
+        session_id = _extract_session_id(request, "/messages")
+        body = await _json_body(request)
+        prepared = await self._prepare_message_send(
+            profile_name=auth["profile_name"],
+            device_id=auth["device_id"],
+            session_id=session_id or "",
+            body=body,
+            transport="sse",
+        )
+        error_info = prepared.get("error")
+        if error_info is not None:
+            return error_response(
+                int(error_info["status"]),
+                str(error_info["code"]),
+                str(error_info["message"]),
+            )
+
+        replay = prepared.get("replay")
+        replay_status = str(prepared.get("replay_status") or "")
+        if replay is not None:
+            if bool(prepared.get("stream_requested")) and replay_status not in ("pending", "running", "streaming"):
+                return await self._stream_replay_response(request, replay)
+            if replay_status in ("pending", "running", "streaming"):
+                return json_response(202, replay)
+            return json_response(200, replay)
+
+        if bool(prepared["defer_completion"]):
+            key = (auth["device_id"], str(prepared["session_id"]))
             task = asyncio.create_task(
                 self._run_and_finalize(
-                profile_name=auth["profile_name"],
-                session_id=session_id,
-                user_message=content,
-                conversation_history=conversation_history,
-                request_id=request_id,
-                accepted_event=accepted_event,
-                started_event=started_event,
-                system_prompt=system_prompt,
-                source_device_id=auth["device_id"],
-            )
+                    profile_name=str(prepared["profile_name"]),
+                    session_id=str(prepared["session_id"]),
+                    user_message=str(prepared["content"]),
+                    conversation_history=list(prepared["conversation_history"]),
+                    request_id=str(prepared["request_id"]),
+                    accepted_event=dict(prepared["accepted_event"]),
+                    started_event=dict(prepared["started_event"]),
+                    system_prompt=prepared.get("system_prompt"),
+                    source_device_id=auth["device_id"],
+                )
             )
             self._active_runs[key] = {
-                "request_id": request_id,
+                "request_id": prepared["request_id"],
                 "task": task,
             }
             task.add_done_callback(lambda _t, k=key: self._active_runs.pop(k, None))
-            return json_response(202, initial_response)
+            return json_response(202, dict(prepared["initial_response"]))
 
-        if stream_requested:
+        if bool(prepared["stream_requested"]):
             return await self._stream_live_response(
                 request=request,
-                profile_name=auth["profile_name"],
-                session_id=session_id,
-                user_message=content,
-                conversation_history=conversation_history,
-                request_id=request_id,
-                accepted_event=accepted_event,
-                started_event=started_event,
-                system_prompt=system_prompt,
+                profile_name=str(prepared["profile_name"]),
+                session_id=str(prepared["session_id"]),
+                user_message=str(prepared["content"]),
+                conversation_history=list(prepared["conversation_history"]),
+                request_id=str(prepared["request_id"]),
+                accepted_event=dict(prepared["accepted_event"]),
+                started_event=dict(prepared["started_event"]),
+                system_prompt=prepared.get("system_prompt"),
                 device_id=auth["device_id"],
             )
 
         try:
             run_payload = await self._run_agent_once(
-                profile_name=auth["profile_name"],
-                session_id=session_id,
-                user_message=content,
-                conversation_history=conversation_history,
-                request_id=request_id,
-                accepted_event=accepted_event,
-                started_event=started_event,
-                system_prompt=system_prompt,
+                profile_name=str(prepared["profile_name"]),
+                session_id=str(prepared["session_id"]),
+                user_message=str(prepared["content"]),
+                conversation_history=list(prepared["conversation_history"]),
+                request_id=str(prepared["request_id"]),
+                accepted_event=dict(prepared["accepted_event"]),
+                started_event=dict(prepared["started_event"]),
+                system_prompt=prepared.get("system_prompt"),
             )
         except Exception as exc:
             failed_payload = {
                 "ok": False,
-                "request_id": request_id,
-                "session_id": session_id,
+                "request_id": prepared["request_id"],
+                "session_id": prepared["session_id"],
                 "idempotency_replayed": False,
                 "error": {
                     "code": "runtime_error",
@@ -811,7 +1063,7 @@ class MobileRoutes:
                 },
             }
             self.store.finalize_message_request(
-                request_id=request_id,
+                request_id=str(prepared["request_id"]),
                 status="failed",
                 response=failed_payload,
             )
@@ -819,7 +1071,7 @@ class MobileRoutes:
 
         run_status = str(run_payload.get("runtime", {}).get("runtime_status") or "completed")
         self.store.finalize_message_request(
-            request_id=request_id,
+            request_id=str(prepared["request_id"]),
             status="waiting" if run_status == "waiting_on_human" else run_status,
             response=run_payload,
         )
@@ -827,27 +1079,47 @@ class MobileRoutes:
             await self._dispatch_runtime_notifications(
                 profile_name=auth["profile_name"],
                 source_device_id=auth["device_id"],
-                session_id=session_id,
-                request_id=request_id,
+                session_id=str(prepared["session_id"]),
+                request_id=str(prepared["request_id"]),
                 event_type="run.waiting",
                 runtime_status=run_status,
                 title="Hermes is waiting for you",
                 body=str(run_payload.get("runtime", {}).get("waiting_prompt") or "Open Talaria to continue the run."),
                 inbox_kind="run.waiting",
-                deep_link_target=f"session:{session_id}",
+                deep_link_target=f"session:{prepared['session_id']}",
             )
         else:
             await self._dispatch_runtime_notifications(
                 profile_name=auth["profile_name"],
                 source_device_id=auth["device_id"],
-                session_id=session_id,
-                request_id=request_id,
+                session_id=str(prepared["session_id"]),
+                request_id=str(prepared["request_id"]),
                 event_type="message.completed",
                 runtime_status=run_status,
                 title="New activity",
                 body="Hermes finished a run.",
             )
         return json_response(202, run_payload)
+
+    async def _write_ws_error(
+        self,
+        websocket: Any,
+        code: str,
+        message: str,
+        *,
+        client_message_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        payload = {
+            "type": "connection.error",
+            "code": code,
+            "message": message,
+        }
+        if client_message_id:
+            payload["client_message_id"] = client_message_id
+        if request_id:
+            payload["request_id"] = request_id
+        await websocket.send_json(payload)
 
     async def _stream_replay_response(self, request: Any, replay_payload: dict):
         response = web.StreamResponse(
@@ -999,32 +1271,25 @@ class MobileRoutes:
                 push_mode=delivery_mode,
             )
 
-    async def _stream_live_response(
+    async def _run_live_stream(
         self,
         *,
-        request: Any,
+        emit_event: Callable[[dict[str, Any]], Any],
+        emit_keepalive: Callable[[], Any] | None,
+        transport: str,
         profile_name: str,
         session_id: str,
         user_message: str,
         conversation_history: list[dict[str, Any]],
         request_id: str,
-        accepted_event: dict,
-        started_event: dict,
+        accepted_event: dict[str, Any],
+        started_event: dict[str, Any],
         system_prompt: str | None,
         device_id: str,
-    ):
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-        await response.prepare(request)
-        event_log: list[dict] = [accepted_event, started_event]
-        await _write_sse_event(response, accepted_event)
-        await _write_sse_event(response, started_event)
+    ) -> None:
+        event_log: list[dict[str, Any]] = [accepted_event, started_event]
+        await emit_event(accepted_event)
+        await emit_event(started_event)
         seq = 2
         handle = await self.profile_runtime.start_run(
             profile_name=profile_name,
@@ -1039,6 +1304,7 @@ class MobileRoutes:
             "request_id": request_id,
             "handle": handle,
             "task": asyncio.current_task(),
+            "transport": transport,
         }
 
         disconnected = False
@@ -1049,8 +1315,10 @@ class MobileRoutes:
                 try:
                     worker_event = await asyncio.wait_for(handle.read_event(), timeout=15.0)
                 except asyncio.TimeoutError:
+                    if emit_keepalive is None:
+                        continue
                     try:
-                        await response.write(b": keepalive\n\n")
+                        await emit_keepalive()
                     except Exception:
                         disconnected = True
                         break
@@ -1059,6 +1327,7 @@ class MobileRoutes:
                     break
 
                 kind = worker_event.get("event")
+                event: dict[str, Any] | None = None
                 if kind == "delta":
                     seq += 1
                     event = {
@@ -1069,15 +1338,7 @@ class MobileRoutes:
                         "delta": str(worker_event.get("delta") or ""),
                         "created_at": time.time(),
                     }
-                    event_log.append(event)
-                    try:
-                        await _write_sse_event(response, event)
-                    except Exception:
-                        disconnected = True
-                        break
-                    continue
-
-                if kind == "tool":
+                elif kind == "tool":
                     seq += 1
                     event = {
                         "id": f"{request_id}:{seq}",
@@ -1090,15 +1351,7 @@ class MobileRoutes:
                         "meta": worker_event.get("meta") or {},
                         "created_at": time.time(),
                     }
-                    event_log.append(event)
-                    try:
-                        await _write_sse_event(response, event)
-                    except Exception:
-                        disconnected = True
-                        break
-                    continue
-
-                if kind == "waiting":
+                elif kind == "waiting":
                     waiting_prompt = str(worker_event.get("prompt") or "").strip() or None
                     seq += 1
                     event = {
@@ -1110,11 +1363,7 @@ class MobileRoutes:
                         "prompt": waiting_prompt,
                         "created_at": time.time(),
                     }
-                    event_log.append(event)
-                    await _write_sse_event(response, event)
-                    continue
-
-                if kind == "resumed":
+                elif kind == "resumed":
                     waiting_prompt = None
                     seq += 1
                     event = {
@@ -1124,13 +1373,9 @@ class MobileRoutes:
                         "session_id": session_id,
                         "created_at": time.time(),
                     }
-                    event_log.append(event)
-                    await _write_sse_event(response, event)
-                    continue
-
-                if kind == "failed":
+                elif kind == "failed":
                     seq += 1
-                    failed_event = {
+                    event = {
                         "id": f"{request_id}:{seq}",
                         "type": "message.failed",
                         "request_id": request_id,
@@ -1141,8 +1386,8 @@ class MobileRoutes:
                         },
                         "created_at": time.time(),
                     }
-                    event_log.append(failed_event)
-                    await _write_sse_event(response, failed_event)
+                    event_log.append(event)
+                    await emit_event(event)
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="failed",
@@ -1151,6 +1396,7 @@ class MobileRoutes:
                             session_id=session_id,
                             events=event_log,
                             ok=False,
+                            transport=transport,
                         ),
                     )
                     await self._dispatch_runtime_notifications(
@@ -1165,9 +1411,8 @@ class MobileRoutes:
                         inbox_kind="run.failed",
                         deep_link_target=f"session:{session_id}",
                     )
-                    return response
-
-                if kind == "completed":
+                    return
+                elif kind == "completed":
                     final_text = str(worker_event.get("content") or "")
                     if final_text and not any(e.get("type") == "message.delta" for e in event_log):
                         seq += 1
@@ -1180,7 +1425,7 @@ class MobileRoutes:
                             "created_at": time.time(),
                         }
                         event_log.append(delta_event)
-                        await _write_sse_event(response, delta_event)
+                        await emit_event(delta_event)
                     seq += 1
                     completed_event = {
                         "id": f"{request_id}:{seq}",
@@ -1192,7 +1437,7 @@ class MobileRoutes:
                         "created_at": time.time(),
                     }
                     event_log.append(completed_event)
-                    await _write_sse_event(response, completed_event)
+                    await emit_event(completed_event)
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="completed",
@@ -1201,6 +1446,7 @@ class MobileRoutes:
                             session_id=session_id,
                             events=event_log,
                             ok=True,
+                            transport=transport,
                         ),
                     )
                     await self._dispatch_runtime_notifications(
@@ -1216,6 +1462,15 @@ class MobileRoutes:
                     completed = True
                     break
 
+                if event is None:
+                    continue
+                event_log.append(event)
+                try:
+                    await emit_event(event)
+                except Exception:
+                    disconnected = True
+                    break
+
             if disconnected:
                 raise ConnectionResetError("client disconnected")
 
@@ -1227,6 +1482,7 @@ class MobileRoutes:
                         session_id=session_id,
                         events=event_log,
                         ok=True,
+                        transport=transport,
                     )
                     self.store.finalize_message_request(
                         request_id=request_id,
@@ -1258,7 +1514,10 @@ class MobileRoutes:
                         "created_at": time.time(),
                     }
                     event_log.append(failed_event)
-                    await _write_sse_event(response, failed_event)
+                    try:
+                        await emit_event(failed_event)
+                    except Exception:
+                        pass
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="failed",
@@ -1267,6 +1526,7 @@ class MobileRoutes:
                             session_id=session_id,
                             events=event_log,
                             ok=False,
+                            transport=transport,
                         ),
                     )
                     await self._dispatch_runtime_notifications(
@@ -1284,14 +1544,13 @@ class MobileRoutes:
         except (ConnectionResetError, asyncio.CancelledError):
             disconnected = True
             handle.abort()
-
             abort_payload = {
                 "ok": True,
                 "request_id": request_id,
                 "session_id": session_id,
                 "idempotency_replayed": False,
                 "stream": {
-                    "transport": "sse",
+                    "transport": transport,
                     "done": True,
                     "events": [
                         *event_log,
@@ -1309,9 +1568,55 @@ class MobileRoutes:
             self.store.abort_request(request_id=request_id, response=abort_payload)
         finally:
             self._active_runs.pop(key, None)
-            if not disconnected:
-                await response.write_eof()
 
+    async def _stream_live_response(
+        self,
+        *,
+        request: Any,
+        profile_name: str,
+        session_id: str,
+        user_message: str,
+        conversation_history: list[dict[str, Any]],
+        request_id: str,
+        accepted_event: dict,
+        started_event: dict,
+        system_prompt: str | None,
+        device_id: str,
+    ):
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+
+        async def emit_event(event: dict[str, Any]) -> None:
+            await _write_sse_event(response, event)
+
+        async def emit_keepalive() -> None:
+            await response.write(b": keepalive\n\n")
+
+        await self._run_live_stream(
+            emit_event=emit_event,
+            emit_keepalive=emit_keepalive,
+            transport="sse",
+            profile_name=profile_name,
+            session_id=session_id,
+            user_message=user_message,
+            conversation_history=conversation_history,
+            request_id=request_id,
+            accepted_event=accepted_event,
+            started_event=started_event,
+            system_prompt=system_prompt,
+            device_id=device_id,
+        )
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
         return response
 
     async def session_abort(self, request: Any):
@@ -1371,13 +1676,14 @@ class MobileRoutes:
         if not task.done():
             task.cancel()
         request_id = active["request_id"]
+        transport = str(active.get("transport") or "sse")
         abort_response = {
             "ok": True,
             "request_id": request_id,
             "session_id": session_id,
             "idempotency_replayed": False,
             "stream": {
-                "transport": "sse",
+                "transport": transport,
                 "done": True,
                 "events": [
                     {
@@ -1418,6 +1724,7 @@ class MobileRoutes:
         session_id: str,
         events: list[dict[str, Any]],
         ok: bool,
+        transport: str = "sse",
     ) -> dict[str, Any]:
         return {
             "ok": ok,
@@ -1425,7 +1732,7 @@ class MobileRoutes:
             "session_id": session_id,
             "idempotency_replayed": False,
             "stream": {
-                "transport": "sse",
+                "transport": transport,
                 "done": True,
                 "events": events,
             },
@@ -1727,6 +2034,7 @@ class MobileRoutes:
 
             request_id = active["request_id"]
             handle = active.get("handle")
+            transport = str(active.get("transport") or "sse")
             if handle is not None:
                 handle.abort()
             task.cancel()
@@ -1739,7 +2047,7 @@ class MobileRoutes:
                     "session_id": session_id,
                     "idempotency_replayed": False,
                     "stream": {
-                        "transport": "sse",
+                        "transport": transport,
                         "done": True,
                         "events": [
                             {
