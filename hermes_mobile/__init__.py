@@ -35,10 +35,6 @@ class PluginContext(Protocol):
         description: str = "",
     ) -> None: ...
 
-    def register_startup_callback(self, callback: Callable[[], None]) -> None: ...
-
-    def register_shutdown_callback(self, callback: Callable[[], None]) -> None: ...
-
 
 def _open_connection(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
@@ -78,9 +74,15 @@ def register(context: PluginContext) -> dict[str, str]:
         store.close()
         conn.close()
 
-    context.register_startup_callback(startup_callback)
-    if hasattr(context, "register_shutdown_callback"):
-        context.register_shutdown_callback(shutdown_callback)
+    register_startup_callback = getattr(context, "register_startup_callback", None)
+    if callable(register_startup_callback):
+        register_startup_callback(startup_callback)
+    else:
+        startup_callback()
+
+    register_shutdown_callback = getattr(context, "register_shutdown_callback", None)
+    if callable(register_shutdown_callback):
+        register_shutdown_callback(shutdown_callback)
     routes.register(context.register_http_route)
     register_operator_surface(context, operator_surface)
     return {

@@ -6,6 +6,41 @@ from hermes_mobile import register
 from helpers import EnvHarness, FakeContext, FakeProfileRuntime, FakeRequest, response_json
 
 
+class LegacyPluginContext:
+    def __init__(self):
+        self.routes = {}
+        self.tools = {}
+        self.cli_commands = {}
+
+    def register_http_route(self, method, path, handler):
+        self.routes[(method.upper(), path)] = handler
+
+    def register_tool(self, name, toolset, schema, handler, **kwargs):
+        self.tools[name] = {
+            "name": name,
+            "toolset": toolset,
+            "schema": schema,
+            "handler": handler,
+            **kwargs,
+        }
+
+    def register_cli_command(
+        self,
+        name,
+        help,
+        setup_fn,
+        handler_fn=None,
+        description="",
+    ):
+        self.cli_commands[name] = {
+            "name": name,
+            "help": help,
+            "setup_fn": setup_fn,
+            "handler_fn": handler_fn,
+            "description": description,
+        }
+
+
 class HermesMobileAuthTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.env = EnvHarness()
@@ -63,6 +98,38 @@ class HermesMobileAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("GET", "/mobile/devices"), self.ctx.routes)
         self.assertIn(("POST", "/mobile/devices/{device_id}/revoke"), self.ctx.routes)
         self.assertIn(("POST", "/mobile/uploads"), self.ctx.routes)
+
+    async def test_registers_with_legacy_context_without_lifecycle_callbacks(self):
+        env = EnvHarness()
+        env.set_up()
+        ctx = LegacyPluginContext()
+        ctx.create_profile_runtime = lambda config: FakeProfileRuntime(str(config.hermes_root))
+        try:
+            plugin_info = register(ctx)
+
+            self.assertEqual(plugin_info["name"], "hermes_mobile")
+            self.assertIn(("GET", "/mobile/capabilities"), ctx.routes)
+            self.assertIn("mobile_install_or_verify", ctx.tools)
+
+            conn = sqlite3.connect(env.db_path)
+            schema_version = conn.execute(
+                "SELECT value FROM mobile_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            mobile_devices = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mobile_devices'"
+            ).fetchone()
+            conn.close()
+
+            self.assertIsNotNone(schema_version)
+            self.assertIsNotNone(mobile_devices)
+        finally:
+            routes = ctx.routes.get(("GET", "/mobile/capabilities"))
+            if routes is not None:
+                owner = routes.__self__
+                await owner.shutdown()
+                owner.store.close()
+                owner.store.conn.close()
+            env.tear_down()
 
     async def test_capabilities(self):
         handler = self.route("GET", "/mobile/capabilities")
