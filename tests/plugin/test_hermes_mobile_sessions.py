@@ -495,6 +495,61 @@ class HermesMobileSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("message.delta", event_types)
         self.assertEqual(event_types[-1], "message.completed")
 
+    async def test_websocket_disconnect_does_not_abort_run(self):
+        routes = self.route("GET", "/mobile/ws").__self__
+        auth = routes.store.resolve_access_token(self.access_token)
+        session_id = "session-ws-disconnect"
+        prepared = await routes._prepare_message_send(
+            profile_name=auth["profile_name"],
+            device_id=auth["device_id"],
+            session_id=session_id,
+            body={
+                "client_message_id": "ws-disconnect-1",
+                "content": "Resume answer after disconnect",
+                "attachment_ids": [],
+            },
+            transport="websocket",
+        )
+        self.assertNotIn("error", prepared)
+
+        sent_event_types: list[str] = []
+
+        async def emit_event(event: dict) -> None:
+            sent_event_types.append(str(event["type"]))
+            if event["type"] == "run.waiting":
+                raise ConnectionResetError("client disconnected")
+
+        await routes._run_live_stream(
+            emit_event=emit_event,
+            emit_keepalive=None,
+            transport="websocket",
+            profile_name=str(prepared["profile_name"]),
+            session_id=str(prepared["session_id"]),
+            user_message=str(prepared["content"]),
+            conversation_history=list(prepared["conversation_history"]),
+            request_id=str(prepared["request_id"]),
+            accepted_event=dict(prepared["accepted_event"]),
+            started_event=dict(prepared["started_event"]),
+            system_prompt=prepared.get("system_prompt"),
+            device_id=str(prepared["device_id"]),
+        )
+
+        conn = sqlite3.connect(self.env.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, response_json FROM mobile_message_requests WHERE id = ?",
+            (prepared["request_id"],),
+        ).fetchone()
+        conn.close()
+
+        self.assertIn("run.waiting", sent_event_types)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "completed")
+        stored_payload = json.loads(row["response_json"])
+        stored_event_types = [event["type"] for event in stored_payload["stream"]["events"]]
+        self.assertEqual(stored_event_types[-1], "message.completed")
+        self.assertNotIn("message.aborted", stored_event_types)
+
     async def test_stream_replay_uses_sse_and_does_not_rerun_agent(self):
         send = self.route("POST", "/mobile/sessions/{session_id}/messages")
         session_id = "session-sse-replay"

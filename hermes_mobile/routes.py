@@ -1288,8 +1288,33 @@ class MobileRoutes:
         device_id: str,
     ) -> None:
         event_log: list[dict[str, Any]] = [accepted_event, started_event]
-        await emit_event(accepted_event)
-        await emit_event(started_event)
+        client_connected = True
+
+        async def emit_if_connected(event: dict[str, Any]) -> None:
+            nonlocal client_connected
+            if not client_connected:
+                return
+            try:
+                await emit_event(event)
+            except Exception:
+                client_connected = False
+
+        def persist_live_progress(status: str = "running") -> None:
+            self.store.finalize_message_request(
+                request_id=request_id,
+                status=status,
+                response=self._payload_from_events(
+                    request_id=request_id,
+                    session_id=session_id,
+                    events=event_log,
+                    ok=True,
+                    transport=transport,
+                    done=False,
+                ),
+            )
+
+        await emit_if_connected(accepted_event)
+        await emit_if_connected(started_event)
         seq = 2
         handle = await self.profile_runtime.start_run(
             profile_name=profile_name,
@@ -1307,7 +1332,6 @@ class MobileRoutes:
             "transport": transport,
         }
 
-        disconnected = False
         completed = False
         waiting_prompt: str | None = None
         try:
@@ -1317,11 +1341,11 @@ class MobileRoutes:
                 except asyncio.TimeoutError:
                     if emit_keepalive is None:
                         continue
-                    try:
-                        await emit_keepalive()
-                    except Exception:
-                        disconnected = True
-                        break
+                    if client_connected:
+                        try:
+                            await emit_keepalive()
+                        except Exception:
+                            client_connected = False
                     continue
                 if worker_event is None:
                     break
@@ -1387,7 +1411,7 @@ class MobileRoutes:
                         "created_at": time.time(),
                     }
                     event_log.append(event)
-                    await emit_event(event)
+                    await emit_if_connected(event)
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="failed",
@@ -1425,7 +1449,7 @@ class MobileRoutes:
                             "created_at": time.time(),
                         }
                         event_log.append(delta_event)
-                        await emit_event(delta_event)
+                        await emit_if_connected(delta_event)
                     seq += 1
                     completed_event = {
                         "id": f"{request_id}:{seq}",
@@ -1437,7 +1461,7 @@ class MobileRoutes:
                         "created_at": time.time(),
                     }
                     event_log.append(completed_event)
-                    await emit_event(completed_event)
+                    await emit_if_connected(completed_event)
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="completed",
@@ -1465,14 +1489,10 @@ class MobileRoutes:
                 if event is None:
                     continue
                 event_log.append(event)
-                try:
-                    await emit_event(event)
-                except Exception:
-                    disconnected = True
-                    break
-
-            if disconnected:
-                raise ConnectionResetError("client disconnected")
+                if event.get("type") != "message.delta":
+                    status = "waiting" if event.get("type") == "run.waiting" else "running"
+                    persist_live_progress(status=status)
+                await emit_if_connected(event)
 
             if completed is False:
                 code, stderr = await handle.wait()
@@ -1514,10 +1534,7 @@ class MobileRoutes:
                         "created_at": time.time(),
                     }
                     event_log.append(failed_event)
-                    try:
-                        await emit_event(failed_event)
-                    except Exception:
-                        pass
+                    await emit_if_connected(failed_event)
                     self.store.finalize_message_request(
                         request_id=request_id,
                         status="failed",
@@ -1541,31 +1558,6 @@ class MobileRoutes:
                         inbox_kind="run.failed",
                         deep_link_target=f"session:{session_id}",
                     )
-        except (ConnectionResetError, asyncio.CancelledError):
-            disconnected = True
-            handle.abort()
-            abort_payload = {
-                "ok": True,
-                "request_id": request_id,
-                "session_id": session_id,
-                "idempotency_replayed": False,
-                "stream": {
-                    "transport": transport,
-                    "done": True,
-                    "events": [
-                        *event_log,
-                        {
-                            "id": f"{request_id}:disconnect",
-                            "type": "message.aborted",
-                            "request_id": request_id,
-                            "session_id": session_id,
-                            "reason": "client_disconnect",
-                            "created_at": time.time(),
-                        },
-                    ],
-                },
-            }
-            self.store.abort_request(request_id=request_id, response=abort_payload)
         finally:
             self._active_runs.pop(key, None)
 
@@ -1725,6 +1717,7 @@ class MobileRoutes:
         events: list[dict[str, Any]],
         ok: bool,
         transport: str = "sse",
+        done: bool = True,
     ) -> dict[str, Any]:
         return {
             "ok": ok,
@@ -1733,7 +1726,7 @@ class MobileRoutes:
             "idempotency_replayed": False,
             "stream": {
                 "transport": transport,
-                "done": True,
+                "done": done,
                 "events": events,
             },
         }
